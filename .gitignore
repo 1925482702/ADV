@@ -1,0 +1,25 @@
+# 忽略整个数据集文件夹
+datasets/
+
+__pycache__/
+*.py[cod]
+*$py.class
+
+
+
+# 忽略所有以 .pth 或 .onnx 结尾的模型权重文件
+*.pth
+*.onnx
+
+# 忽略特定的子目录
+checkpoint
+checkpoint/
+docs/
+monomodal/
+runs/
+tasks/
+
+
+# 忽略 Python 缓存和虚拟环境
+__pycache__/
+.venv/
