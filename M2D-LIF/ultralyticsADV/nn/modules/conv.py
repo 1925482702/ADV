@@ -7,8 +7,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-__all__ = ('Add', 'ConvFusion', 'Conv', 'Conv2', 'LightConv', 'DWConv', 'DWConvTranspose2d', 'ConvTranspose', 'Focus', 'GhostConv',
-
+__all__ = ('Add', 'Conv', 'Conv2', 'LightConv', 'DWConv', 'DWConvTranspose2d', 'ConvTranspose', 'Focus', 'GhostConv',
            'ChannelAttention', 'SpatialAttention', 'CBAM', 'Concat', 'RepConv')
 
 
@@ -16,74 +15,15 @@ __all__ = ('Add', 'ConvFusion', 'Conv', 'Conv2', 'LightConv', 'DWConv', 'DWConvT
 
 
 class Add(nn.Module):
-
-    """Add two tensors (simple average fusion)."""
-
-
+    """Add two tensors."""
 
     def __init__(self):
-
         """Initialize the Add module."""
-
         super().__init__()
 
-
-
     def forward(self, x):
-
         """Forward pass to add two tensors."""
-
         return torch.add(0.5*x[0], 0.5*x[1])
-
-
-
-
-
-class ConvFusion(nn.Module):
-
-    """
-
-    Convolution-based fusion module for dual-branch features.
-
-    Replaces simple Add with learnable convolution fusion.
-
-    
-
-    Args:
-
-        c1: Input channel (each branch has c1 channels)
-
-        c2: Output channel after fusion
-
-        k: Kernel size for fusion conv (default: 1)
-
-    """
-
-
-
-    def __init__(self, c1, c2=None, k=1):
-
-        """Initialize ConvFusion module."""
-
-        super().__init__()
-
-        c2 = c2 or c1  # default output channel equals input
-
-        # Concat two branches and fuse with conv
-
-        self.fusion_conv = Conv(c1 * 2, c2, k=k, s=1)
-
-
-
-    def forward(self, x):
-
-        """Forward pass: concat two branch features and fuse with conv."""
-
-        # x is a list of two tensors [rgb_feat, ir_feat]
-
-        # Concat along channel dimension and apply fusion conv
-
-        return self.fusion_conv(torch.cat(x, dim=1))
 
 
 def autopad(k, p=None, d=1):  # kernel, padding, dilation

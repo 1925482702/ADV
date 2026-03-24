@@ -1,0 +1,84 @@
+# Dual-branch YOLOv8 with frozen teacher backbones and convolution fusion
+# RGB and IR branches use pretrained teacher weights (frozen)
+# Features are fused using ConvFusion (learnable conv layer)
+
+ch: 6  # 6-channel input (RGB + IR)
+nc: 3  # FLIR dataset classes
+
+scales: # model compound scaling constants
+  # [depth, width, max_channels]
+  n: [ 0.33, 0.25, 1024 ]  # YOLOv8n
+  s: [ 0.33, 0.50, 1024 ]  # YOLOv8s
+  m: [ 0.67, 0.75, 768 ]   # YOLOv8m
+  l: [ 1.00, 1.00, 512 ]   # YOLOv8l
+  x: [ 1.00, 1.25, 512 ]   # YOLOv8x
+
+backbone:
+  # Input: 6-channel (RGB + IR concatenated)
+  - [ -1, 1, IN, [ ] ]           # 0: Identity (pass through)
+  - [ -1, 1, Multiin, [ 1 ] ]    # 1: Split RGB (first 3 channels)
+  - [ -2, 1, Multiin, [ 2 ] ]    # 2: Split IR (last 3 channels)
+
+  # Dual-branch backbone (layers 3-12)
+  # Odd layers: RGB branch, Even layers: IR branch
+  - [ -2, 1, Conv, [ 64, 3, 2 ] ]   # 3: P1/2 - RGB
+  - [ -2, 1, Conv, [ 64, 3, 2 ] ]   # 4: P1/2 - IR
+
+  - [ -2, 1, Conv, [ 128, 3, 2 ] ]  # 5: P2/4 - RGB
+  - [ -2, 1, Conv, [ 128, 3, 2 ] ]  # 6: P2/4 - IR
+
+  - [ -2, 3, C2f, [ 128, True ] ]   # 7: RGB C2f
+  - [ -2, 3, C2f, [ 128, True ] ]   # 8: IR C2f
+
+  - [ -2, 1, Conv, [ 256, 3, 2 ] ]  # 9: P3/8 - RGB
+  - [ -2, 1, Conv, [ 256, 3, 2 ] ]  # 10: P3/8 - IR
+
+  - [ -2, 6, C2f, [ 256, True ] ]   # 11: RGB C2f
+  - [ -2, 6, C2f, [ 256, True ] ]   # 12: IR C2f
+
+  # ConvFusion at P3 level (replaces Add)
+  # Input: [-1, -2] = [layer 12, layer 11] = [IR, RGB]
+  - [ [ -1, -2 ], 1, ConvFusion, [ 256, 1 ] ]  # 13: Fuse P3 features
+
+  # Continue dual-branch after fusion (from -3 to skip fusion layer)
+  - [ -3, 1, Conv, [ 512, 3, 2 ] ]  # 14: P4/16 - RGB
+  - [ -3, 1, Conv, [ 512, 3, 2 ] ]  # 15: P4/16 - IR
+
+  - [ -2, 6, C2f, [ 512, True ] ]   # 16: RGB C2f
+  - [ -2, 6, C2f, [ 512, True ] ]   # 17: IR C2f
+
+  # ConvFusion at P4 level
+  - [ [ -1, -2 ], 1, ConvFusion, [ 512, 1 ] ]  # 18: Fuse P4 features
+
+  - [ -3, 1, Conv, [ 1024, 3, 2 ] ] # 19: P5/32 - RGB
+  - [ -3, 1, Conv, [ 1024, 3, 2 ] ] # 20: P5/32 - IR
+
+  - [ -2, 3, C2f, [ 1024, True ] ]  # 21: RGB C2f
+  - [ -2, 3, C2f, [ 1024, True ] ]  # 22: IR C2f
+
+  # ConvFusion at P5 level
+  - [ [ -1, -2 ], 1, ConvFusion, [ 1024, 1 ] ] # 23: Fuse P5 features
+
+  - [ -1, 1, SPPF, [ 512, 5 ] ]      # 24: SPPF
+
+head:
+  # FPN (top-down pathway)
+  - [ -1, 1, nn.Upsample, [ None, 2, 'nearest' ] ]
+  - [ [ -1, 18 ], 1, Concat, [ 1 ] ]  # cat P4 features (layer 18 is ConvFusion output)
+  - [ -1, 3, C2f, [ 512 ] ]           # 27
+
+  - [ -1, 1, nn.Upsample, [ None, 2, 'nearest' ] ]
+  - [ [ -1, 13 ], 1, Concat, [ 1 ] ]  # cat P3 features (layer 13 is ConvFusion output)
+  - [ -1, 3, C2f, [ 256 ] ]           # 30 (P3/8-small)
+
+  # PAN (bottom-up pathway)
+  - [ -1, 1, Conv, [ 256, 3, 2 ] ]
+  - [ [ -1, 27 ], 1, Concat, [ 1 ] ]  # cat head P4
+  - [ -1, 3, C2f, [ 512 ] ]           # 33 (P4/16-medium)
+
+  - [ -1, 1, Conv, [ 512, 3, 2 ] ]
+  - [ [ -1, 24 ], 1, Concat, [ 1 ] ]  # cat head P5 (layer 24 is SPPF output)
+  - [ -1, 3, C2f, [ 1024 ] ]          # 36 (P5/32-large)
+
+  # Detection head
+  - [ [ 30, 33, 36 ], 1, Detect, [ nc ] ]  # Detect(P3, P4, P5)

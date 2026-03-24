@@ -359,117 +359,6 @@ class DetectionModel(BaseModel):
         return v8DetectionLoss(self)
 
 
-class FrozenDualBranchModel(DetectionModel):
-    """
-    Dual-branch detection model with frozen teacher backbones.
-    
-    This model uses pretrained RGB and IR teacher models as frozen backbones,
-    then fuses features with learnable convolution layers.
-    
-    Args:
-        cfg: Model configuration YAML
-        ch: Input channels (default: 6 for RGB+IR)
-        nc: Number of classes
-        rgb_weight: Path to RGB teacher checkpoint
-        ir_weight: Path to IR teacher checkpoint
-        verbose: Whether to print model info
-    """
-    
-    def __init__(self, cfg='yolov8_dual_frozen.yaml', ch=6, nc=None, 
-                 rgb_weight=None, ir_weight=None, verbose=True):
-        # Store teacher weight paths
-        self.rgb_weight = rgb_weight
-        self.ir_weight = ir_weight
-        
-        # Initialize base DetectionModel
-        super().__init__(cfg=cfg, ch=ch, nc=nc, verbose=verbose)
-        
-        # Load and freeze backbone weights from teachers
-        if rgb_weight and ir_weight:
-            self._load_frozen_backbones(rgb_weight, ir_weight)
-    
-    def _load_frozen_backbones(self, rgb_weight, ir_weight):
-        """Load backbone weights from teacher models and freeze them."""
-        import torch
-        
-        # Load teacher checkpoints
-        rgb_ckpt = torch.load(rgb_weight, map_location='cpu')
-        ir_ckpt = torch.load(ir_weight, map_location='cpu')
-        
-        rgb_state = rgb_ckpt['model'].state_dict() if 'model' in rgb_ckpt else rgb_ckpt
-        ir_state = ir_ckpt['model'].state_dict() if 'model' in ir_ckpt else ir_ckpt
-        
-        # Map teacher backbone layers to our dual-branch model
-        # In baseline yaml: layers 3-12 are backbone conv/c2f layers for each branch
-        # RGB branch: layers 3,5,7,9,11 (odd indices after Multiin)
-        # IR branch: layers 4,6,8,10,12 (even indices after Multiin)
-        
-        model_state = self.state_dict()
-        
-        # Build mapping from teacher to student
-        # Teacher backbone: layers 0-9 (Conv, Conv, C2f, Conv, C2f, Conv, C2f, Conv, C2f, SPPF)
-        # Student backbone split:
-        #   RGB: model.3 (Conv64), model.5 (Conv128), model.7 (C2f128), model.9 (Conv256), ...
-        #   IR:  model.4 (Conv64), model.6 (Conv128), model.8 (C2f128), model.10 (Conv256), ...
-        
-        # Create layer mapping
-        # Teacher layer -> Student RGB layer, Student IR layer
-        teacher_layer_indices = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]  # backbone layers in teacher
-        
-        # Student layer indices for RGB and IR branches (based on yaml structure)
-        # After IN(0), Multiin(1), Multiin(2), the dual backbone starts
-        # Layer 3,5,7,9,11,13,15,17,19,21,23 for one branch (odd)
-        # Layer 4,6,8,10,12,14,16,18,20,22,24 for other branch (even)
-        # But actually from yaml: layers 3-4, 5-6, 7-8, 9-10, 11-12, etc. are pairs
-        
-        loaded_count = 0
-        frozen_count = 0
-        
-        for name, param in self.named_parameters():
-            # Parse layer index from name (e.g., 'model.3.conv.weight' -> layer 3)
-            parts = name.split('.')
-            if len(parts) >= 2 and parts[0] == 'model':
-                try:
-                    layer_idx = int(parts[1])
-                except ValueError:
-                    continue
-                
-                # Determine if this is a backbone layer and which branch
-                # Based on yolov8_naive_add.yaml:
-                # Layer 0: IN, 1: Multiin(RGB), 2: Multiin(IR)
-                # Layers 3,5,7,9,11,13,15,17,19,21,23 -> RGB branch
-                # Layers 4,6,8,10,12,14,16,18,20,22,24 -> IR branch
-                # After SPPF (layer 24 in baseline), we have neck layers
-                
-                if layer_idx <= 2:  # Skip IN and Multiin layers
-                    continue
-                
-                # Map to teacher backbone layer
-                # RGB branch (odd layers starting from 3): 3->0, 5->1, 7->2, ...
-                # IR branch (even layers starting from 4): 4->0, 6->1, 8->2, ...
-                
-                if layer_idx >= 3 and layer_idx <= 24:  # Backbone layers range
-                    if (layer_idx - 3) % 2 == 0:  # RGB branch (3,5,7,...,23)
-                        teacher_layer_idx = (layer_idx - 3) // 2
-                        teacher_name = name.replace(f'model.{layer_idx}', f'model.{teacher_layer_idx}')
-                        if teacher_name in rgb_state:
-                            param.data.copy_(rgb_state[teacher_name])
-                            loaded_count += 1
-                    else:  # IR branch (4,6,8,...,24)
-                        teacher_layer_idx = (layer_idx - 4) // 2
-                        teacher_name = name.replace(f'model.{layer_idx}', f'model.{teacher_layer_idx}')
-                        if teacher_name in ir_state:
-                            param.data.copy_(ir_state[teacher_name])
-                            loaded_count += 1
-                    
-                    # Freeze backbone parameters
-                    param.requires_grad = False
-                    frozen_count += 1
-        
-        LOGGER.info(f'Loaded {loaded_count} backbone parameters from teachers')
-        LOGGER.info(f'Frozen {frozen_count} backbone parameters')
-
-
 class OBBModel(DetectionModel):
     """"YOLOv8 Oriented Bounding Box (OBB) model."""
 
@@ -891,11 +780,6 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             c2 = ch[f]//2
         elif m in (Add, LIFAdd):
             c2 = ch[f[0]]
-        elif m is ConvFusion:
-            # ConvFusion: takes two branch inputs, concatenates and fuses with conv
-            c1 = ch[f[0]]  # input channels from each branch
-            c2 = args[0] if len(args) > 0 else c1  # output channels
-            args = [c1, c2] + list(args[1:])  # [c1, c2, k]
         elif m is LIF:
             c2 = 1
         elif m is AIFI:
