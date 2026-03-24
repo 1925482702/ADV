@@ -8,7 +8,7 @@ __pycache__/
 
 
 # 忽略所有以 .pth 或 .onnx 结尾的模型权重文件
-*.pth
+*.pt
 *.onnx
 
 # 忽略特定的子目录
@@ -19,7 +19,9 @@ monomodal/
 runs/
 tasks/
 
+/root/autodl-tmp/ADV/M2D-LIF/runs/
 
 # 忽略 Python 缓存和虚拟环境
 __pycache__/
 .venv/
+/root/autodl-tmp/ADV/ADV_backup.zip
