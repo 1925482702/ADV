@@ -39,51 +39,183 @@ class Add(nn.Module):
 
 
 
-class ConvFusion(nn.Module):
+# class ConvFusion(nn.Module):
 
-    """
+#     """
 
-    Convolution-based fusion module for dual-branch features.
+#     Convolution-based fusion module for dual-branch features.
 
-    Replaces simple Add with learnable convolution fusion.
+#     Replaces simple Add with learnable convolution fusion.
 
     
 
+#     Args:
+
+#         c1: Input channel (each branch has c1 channels)
+
+#         c2: Output channel after fusion
+
+#         k: Kernel size for fusion conv (default: 1)
+
+#     """
+
+
+
+#     def __init__(self, c1, c2=None, k=1):
+
+#         """Initialize ConvFusion module."""
+
+#         super().__init__()
+
+#         c2 = c2 or c1  # default output channel equals input
+
+#         # Concat two branches and fuse with conv
+
+#         self.fusion_conv = Conv(c1 * 2, c2, k=k, s=1)
+
+
+
+#     def forward(self, x):
+
+#         """Forward pass: concat two branch features and fuse with conv."""
+
+#         # x is a list of two tensors [rgb_feat, ir_feat]
+
+
+
+#         # Concat along channel dimension and apply fusion conv
+
+#         return self.fusion_conv(torch.cat(x, dim=1))
+
+# class ConvFusion(nn.Module):
+#     """
+#     ConvFusion with residual connection.
+#     3-layer bottleneck + shortcut for better gradient flow.
+    
+#     Args:
+#         c1: Input channel (each branch has c1 channels)
+#         c2: Output channel after fusion
+#         e: Expansion ratio for hidden channels (default: 0.5)
+#     """
+
+#     def __init__(self, c1, c2=None, e=0.5):
+#         super().__init__()
+#         c2 = c2 or c1
+#         c_ = int(c1 * e)
+#         self.conv1 = Conv(c1 * 2, c_, k=1, s=1)
+#         self.conv2 = Conv(c_, c_, k=3, s=1)
+#         self.conv3 = Conv(c_, c2, k=1, s=1)
+#         # Shortcut connection
+#         self.shortcut = Conv(c1 * 2, c2, k=1, s=1) if c1 * 2 != c2 else nn.Identity()
+
+#     def forward(self, x):
+#         y = torch.cat(x, dim=1)
+#         return self.shortcut(y) + self.conv3(self.conv2(self.conv1(y)))
+
+
+# class ConvFusion(nn.Module):
+#     """
+#     ConvFusion with SE attention + Shortcut.
+#     3-layer bottleneck + channel attention + residual connection.
+    
+#     Args:
+#         c1: Input channel (each branch has c1 channels)
+#         c2: Output channel after fusion
+#         e: Expansion ratio for hidden channels (default: 0.5)
+#         reduction: SE reduction ratio (default: 16)
+#     """
+
+#     def __init__(self, c1, c2=None, e=0.5, reduction=16):
+#         super().__init__()
+#         c2 = c2 or c1
+#         c_ = int(c1 * e)
+#         self.conv1 = Conv(c1 * 2, c_, k=1, s=1)
+#         self.conv2 = Conv(c_, c_, k=3, s=1)
+#         self.conv3 = Conv(c_, c2, k=1, s=1)
+#         # SE attention
+#         self.se = nn.Sequential(
+#             nn.AdaptiveAvgPool2d(1),
+#             nn.Conv2d(c2, max(c2 // reduction, 1), 1),
+#             nn.SiLU(),
+#             nn.Conv2d(max(c2 // reduction, 1), c2, 1),
+#             nn.Sigmoid()
+#         )
+#         # Shortcut connection
+#         self.shortcut = Conv(c1 * 2, c2, k=1, s=1) if c1 * 2 != c2 else nn.Identity()
+
+#     def forward(self, x):
+#         y = torch.cat(x, dim=1)
+#         out = self.conv3(self.conv2(self.conv1(y)))
+#         return out * self.se(out) + self.shortcut(y)
+
+
+# class ConvFusion(nn.Module):
+#     """
+#     ConvFusion with C2f + SE attention + Shortcut.
+#     Dense connections + channel attention + residual connection.
+    
+#     Args:
+#         c1: Input channel (each branch has c1 channels)
+#         c2: Output channel after fusion
+#         n: Number of bottleneck blocks (default: 2)
+#         e: Expansion ratio for hidden channels (default: 0.5)
+#         reduction: SE reduction ratio (default: 16)
+#     """
+
+#     def __init__(self, c1, c2=None, n=2, e=0.5, reduction=16):
+#         super().__init__()
+#         c2 = c2 or c1
+#         c_ = int(c1 * e)
+#         self.cv1 = Conv(c1 * 2, 2 * c_, k=1, s=1)
+#         self.cv2 = Conv((2 + n) * c_, c2, k=1, s=1)
+#         self.m = nn.ModuleList(self._make_bottleneck(c_) for _ in range(n))
+#         # SE attention
+#         self.se = nn.Sequential(
+#             nn.AdaptiveAvgPool2d(1),
+#             nn.Conv2d(c2, max(c2 // reduction, 1), 1),
+#             nn.SiLU(),
+#             nn.Conv2d(max(c2 // reduction, 1), c2, 1),
+#             nn.Sigmoid()
+#         )
+#         # Shortcut connection
+#         self.shortcut = Conv(c1 * 2, c2, k=1, s=1) if c1 * 2 != c2 else nn.Identity()
+
+#     def _make_bottleneck(self, c):
+#         """Create a simple bottleneck block."""
+#         return nn.Sequential(
+#             Conv(c, c, k=3, s=1),
+#             Conv(c, c, k=3, s=1)
+#         )
+
+#     def forward(self, x):
+#         y_cat = torch.cat(x, dim=1)
+#         y = list(self.cv1(y_cat).chunk(2, 1))
+#         y.extend(m(y[-1]) for m in self.m)
+#         out = self.cv2(torch.cat(y, 1))
+#         return out * self.se(out) + self.shortcut(y_cat)
+
+class ConvFusion(nn.Module):
+    """
+    Simple Add fusion (baseline).
+    Directly adds two branch features with equal weight.
+    No learnable parameters.
+    
     Args:
-
         c1: Input channel (each branch has c1 channels)
-
-        c2: Output channel after fusion
-
-        k: Kernel size for fusion conv (default: 1)
-
+        c2: Output channel (equals c1 for simple add)
+        k: Kernel size (ignored, for interface compatibility)
     """
 
-
-
     def __init__(self, c1, c2=None, k=1):
-
-        """Initialize ConvFusion module."""
-
         super().__init__()
-
-        c2 = c2 or c1  # default output channel equals input
-
-        # Concat two branches and fuse with conv
-
-        self.fusion_conv = Conv(c1 * 2, c2, k=k, s=1)
-
-
+        self.c1 = c1
+        self.c2 = c2 or c1
 
     def forward(self, x):
-
-        """Forward pass: concat two branch features and fuse with conv."""
-
+        """Forward pass: average of two branch features."""
         # x is a list of two tensors [rgb_feat, ir_feat]
+        return 0.5 * x[0] + 0.5 * x[1]
 
-        # Concat along channel dimension and apply fusion conv
-
-        return self.fusion_conv(torch.cat(x, dim=1))
 
 
 def autopad(k, p=None, d=1):  # kernel, padding, dilation

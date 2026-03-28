@@ -100,7 +100,7 @@ def load_frozen_backbones(model, rgb_weight, ir_weight):
 
 def main():
     parser = argparse.ArgumentParser(description='Train dual-branch model with frozen teacher backbones')
-    parser.add_argument('--scale', type=str, default='s', choices=['n', 's', 'm', 'l', 'x'],
+    parser.add_argument('--scale', type=str, default='m', choices=['n', 's', 'm', 'l', 'x'],
                         help='Model scale (must match teacher models)')
     parser.add_argument('--epochs', type=int, default=100, help='Number of training epochs')
     parser.add_argument('--batch', type=int, default=16, help='Batch size')
@@ -111,8 +111,6 @@ def main():
     parser.add_argument('--ir-weight', type=str,
                         default='/root/autodl-tmp/ADV/checkpoint/monomodal/FLIR_ir.pt',
                         help='Path to IR teacher checkpoint')
-    parser.add_argument('--fusion-kernel', type=int, default=1, 
-                        help='ConvFusion kernel size (1 or 3)')
     args = parser.parse_args()
     
     # Model config (use scale-specific yaml)
@@ -126,7 +124,6 @@ def main():
     
     print(f"[INFO] Model config: {model_yaml}")
     print(f"[INFO] Scale: {args.scale}")
-    print(f"[INFO] Fusion kernel size: {args.fusion_kernel}")
     
     # Load model
     model = YOLO(model_yaml)
@@ -147,9 +144,9 @@ def main():
         batch=args.batch,
         workers=8,
         project='./runs/frozen_teacher',
-        name=f'yolov8{args.scale}_frozen_fusion{args.fusion_kernel}',
+        name=f'yolov8{args.scale}_frozen_5layer',
         lr0=0.01,
-        augment=False
+        augment=True
     )
 
 

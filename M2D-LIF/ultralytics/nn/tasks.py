@@ -892,9 +892,10 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
         elif m in (Add, LIFAdd):
             c2 = ch[f[0]]
         elif m is ConvFusion:
-            # ConvFusion: takes two branch inputs, concatenates and fuses with conv
+            # ConvFusion: takes two branch inputs, fuses them
+            # For simple Add fusion, output channels = input channels
             c1 = ch[f[0]]  # input channels from each branch
-            c2 = args[0] if len(args) > 0 else c1  # output channels
+            c2 = c1  # output channels must equal input for Add fusion
             args = [c1, c2] + list(args[1:])  # [c1, c2, k]
         elif m is LIF:
             c2 = 1
