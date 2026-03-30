@@ -1908,10 +1908,180 @@ def v8_transforms(dataset, imgsz, hyp, stretch=False):
         ]
     )  # transforms
 
+# ============================================================================
+# ObjectShift: 跨模态物体平移增强
+# ============================================================================
+class ObjectShift:
+    """
+    跨模态物体平移增强
+    
+    功能：
+    1. 选择2个目标（最大 + 随机）进行平移
+    2. RGB和IR分别独立随机平移
+    3. 空洞用边界像素插值填充 + 高斯模糊
+    4. 生成GT：(dx, dy) = RGB平移量 - IR平移量的均值
+    """
+    
+    def __init__(self, p=0.5, shift_range=(10, 50), border_width=5):
+        """
+        Args:
+            p: 应用概率
+            shift_range: 平移范围 [min, max] 像素
+            border_width: 边界采样宽度
+        """
+        self.p = p
+        self.shift_range = shift_range
+        self.border_width = border_width
+    
+    def __call__(self, labels):
+        """应用物体平移增强"""
+        # 初始化GT（默认不平移）
+        labels['shift_dx'] = 0.0
+        labels['shift_dy'] = 0.0
+        
+        # 概率检查
+        if random.random() > self.p:
+            return labels
+        
+        # 获取bbox
+        instances = labels.get('instances')
+        if instances is None or len(instances) == 0:
+            return labels
+        
+        bboxes = instances.bboxes  # xyxy格式
+        
+        # 选择目标（最大 + 随机）
+        target_indices = self._select_targets(bboxes)
+        if len(target_indices) == 0:
+            return labels
+        
+        # 分离RGB和IR
+        img = labels['img']
+        img_rgb = img[:, :, :3].copy()
+        img_ir = img[:, :, 3:].copy()
+        
+        shift_min, shift_max = self.shift_range
+        shift_dxs = []
+        shift_dys = []
+        
+        for idx in target_indices:
+            target_bbox = bboxes[idx].astype(int)
+            
+            # 随机生成平移量
+            dx_rgb = random.randint(-shift_max, shift_max)
+            dy_rgb = random.randint(-shift_max, shift_max)
+            dx_ir = random.randint(-shift_max, shift_max)
+            dy_ir = random.randint(-shift_max, shift_max)
+            
+            # 平移RGB和IR中的物体
+            img_rgb = self._shift_object(img_rgb, target_bbox, dx_rgb, dy_rgb)
+            img_ir = self._shift_object(img_ir, target_bbox, dx_ir, dy_ir)
+            
+            # 记录相对偏移
+            shift_dxs.append(dx_rgb - dx_ir)
+            shift_dys.append(dy_rgb - dy_ir)
+        
+        # 合并图像
+        labels['img'] = np.concatenate([img_rgb, img_ir], axis=2)
+        
+        # GT: 多目标的均值
+        labels['shift_dx'] = float(np.mean(shift_dxs))
+        labels['shift_dy'] = float(np.mean(shift_dys))
+        
+        return labels
+    
+    def _select_targets(self, bboxes):
+        """选择2个目标：最大 + 随机"""
+        if len(bboxes) == 0:
+            return []
+        
+        # 计算面积
+        areas = (bboxes[:, 2] - bboxes[:, 0]) * (bboxes[:, 3] - bboxes[:, 1])
+        
+        # 过滤太小的
+        valid_mask = areas > 100
+        valid_indices = np.where(valid_mask)[0]
+        
+        if len(valid_indices) == 0:
+            return []
+        if len(valid_indices) == 1:
+            return [valid_indices[0]]
+        
+        # 选最大的
+        sorted_by_area = valid_indices[np.argsort(areas[valid_indices])[::-1]]
+        largest_idx = sorted_by_area[0]
+        
+        # 随机选一个（排除最大的）
+        remaining = sorted_by_area[1:]
+        random_idx = random.choice(remaining)
+        
+        return [largest_idx, random_idx]
+    
+    def _get_border_pixels(self, img, bbox):
+        """获取物体边界外侧的像素用于填充"""
+        x1, y1, x2, y2 = bbox
+        H, W = img.shape[:2]
+        
+        pixels = []
+        if y1 >= self.border_width:
+            pixels.append(img[y1 - self.border_width:y1, x1:x2].reshape(-1, 3))
+        if y2 + self.border_width <= H:
+            pixels.append(img[y2:y2 + self.border_width, x1:x2].reshape(-1, 3))
+        if x1 >= self.border_width:
+            pixels.append(img[y1:y2, x1 - self.border_width:x1].reshape(-1, 3))
+        if x2 + self.border_width <= W:
+            pixels.append(img[y1:y2, x2:x2 + self.border_width].reshape(-1, 3))
+        
+        if pixels:
+            return np.concatenate(pixels, axis=0)
+        else:
+            return np.array([[114, 114, 114]])
+    
+    def _shift_object(self, img, bbox, dx, dy):
+        """平移图像中的物体"""
+        x1, y1, x2, y2 = bbox
+        H, W = img.shape[:2]
+        obj_h, obj_w = y2 - y1, x2 - x1
+        
+        # 1. 裁剪物体
+        obj = img[y1:y2, x1:x2].copy()
+        
+        # 2. 填补空洞（用边界像素均值）
+        border_pixels = self._get_border_pixels(img, bbox)
+        fill_value = np.mean(border_pixels, axis=0).astype(img.dtype)
+        img[y1:y2, x1:x2] = fill_value
+        
+        # 3. 对空洞区域加高斯模糊（消除插值痕迹）
+        hole_region = img[y1:y2, x1:x2]
+        img[y1:y2, x1:x2] = cv2.GaussianBlur(hole_region, (5, 5), 0)
+        
+        # 4. 计算新位置（确保在图像范围内）
+        new_x1 = np.clip(x1 + dx, 0, W - obj_w)
+        new_y1 = np.clip(y1 + dy, 0, H - obj_h)
+        new_x2 = new_x1 + obj_w
+        new_y2 = new_y1 + obj_h
+        
+        # 5. 放置到新位置
+        img[new_y1:new_y2, new_x1:new_x2] = obj
+        
+        return img
+
+
 # import pdb
 # pdb.set_trace()
-def v8_Pairedtransforms(dataset, imgsz, hyp, stretch=False):
-    """Convert images to a size suitable for YOLOv8 training."""
+def v8_Pairedtransforms(dataset, imgsz, hyp, stretch=False, shift_cfg=None):
+    """Convert images to a size suitable for YOLOv8 training.
+    
+    Args:
+        dataset: 数据集
+        imgsz: 图像尺寸
+        hyp: 超参数
+        stretch: 是否拉伸
+        shift_cfg: 平移增强配置，包含：
+            - p: 平移概率
+            - shift_range: 平移范围 (min, max)
+            - border_width: 边界采样宽度
+    """
     pre_transform = Compose(
         [
             PairedMosaic(dataset, imgsz=imgsz, p=hyp.mosaic),
@@ -1927,20 +2097,21 @@ def v8_Pairedtransforms(dataset, imgsz, hyp, stretch=False):
         ]
     )
     flip_idx = dataset.data.get("flip_idx", [])  # for keypoints augmentation
-    # if dataset.use_keypoints:
-    #     kpt_shape = dataset.data.get("kpt_shape", None)
-    #     if len(flip_idx) == 0 and hyp.fliplr > 0.0:
-    #         hyp.fliplr = 0.0
-    #         LOGGER.warning("WARNING ⚠️ No 'flip_idx' array defined in data.yaml, setting augmentation 'fliplr=0.0'")
-    #     elif flip_idx and (len(flip_idx) != kpt_shape[0]):
-    #         raise ValueError(f"data.yaml flip_idx={flip_idx} length must be equal to kpt_shape[0]={kpt_shape[0]}")
+
+    # 创建 ObjectShift 实例
+    shift_cfg = shift_cfg or {}
+    object_shift = ObjectShift(
+        p=shift_cfg.get('p', 0.5),
+        shift_range=shift_cfg.get('shift_range', (10, 50)),
+        border_width=shift_cfg.get('border_width', 5)
+    )
 
     return Compose(
         [
             pre_transform,
             PairedMixUp(dataset, pre_transform=pre_transform, p=hyp.mixup),
             PairedAlbumentations(p=1.0),
-            # PairedRandomHSV(hgain=hyp.hsv_h, sgain=hyp.hsv_s, vgain=hyp.hsv_v),
+            object_shift,  # 跨模态物体平移增强
             PairedRandomFlip(direction="vertical", p=hyp.flipud),
             PairedRandomFlip(direction="horizontal", p=hyp.fliplr, flip_idx=flip_idx),
         ]

@@ -710,3 +710,40 @@ class v8OBBLoss(v8DetectionLoss):
             b, a, c = pred_dist.shape  # batch, anchors, channels
             pred_dist = pred_dist.view(b, a, 4, c // 4).softmax(3).matmul(self.proj.type(pred_dist.dtype))
         return torch.cat((dist2rbox(pred_dist, pred_angle, anchor_points), pred_angle), dim=-1)
+
+
+# ============================================================================
+# ShiftLoss: 跨模态平移预测损失
+# ============================================================================
+class ShiftLoss(nn.Module):
+    """
+    跨模态平移预测损失
+    
+    使用 Smooth L1 Loss，在误差较大时提供稳定梯度，在误差接近0时更加平滑
+    """
+    
+    def __init__(self, max_shift=50.0, loss_weight=1.0):
+        """
+        Args:
+            max_shift: 最大平移量（用于归一化）
+            loss_weight: 损失权重
+        """
+        super().__init__()
+        self.max_shift = max_shift
+        self.loss_weight = loss_weight
+    
+    def forward(self, pred_shift, gt_shift):
+        """
+        Args:
+            pred_shift: (B, 2) 预测的 [dx, dy]
+            gt_shift: (B, 2) 真实的 [dx, dy]
+        Returns:
+            loss: 标量损失
+        """
+        # 归一化到 [-1, 1] 范围
+        pred_norm = pred_shift / self.max_shift
+        gt_norm = gt_shift / self.max_shift
+        
+        # 使用 Smooth L1 Loss
+        loss = F.smooth_l1_loss(pred_norm, gt_norm)
+        return loss * self.loss_weight
