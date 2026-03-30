@@ -493,6 +493,13 @@ class ShiftDetectionTrainer(DetectionTrainer):
                         shift_loss = self.shift_loss_fn(shift_pred, batch['shift_gt'])
                         # 添加到总 loss
                         self.loss = self.loss + self.current_shift_lambda * shift_loss
+                        
+                        # 调试信息：每 100 步打印一次
+                        if ni % 100 == 0:
+                            gt_mean = batch['shift_gt'].abs().mean().item()
+                            pred_mean = shift_pred.abs().mean().item()
+                            LOGGER.info(f'SHIFT DEBUG: GT mean={gt_mean:.2f}, Pred mean={pred_mean:.2f}, Loss={shift_loss.item():.4f}')
+                        
                         # 更新 loss_items
                         self.loss_items = torch.cat([self.loss_items, shift_loss.detach().unsqueeze(0)])
                     else:

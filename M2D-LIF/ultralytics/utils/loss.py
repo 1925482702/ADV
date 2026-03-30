@@ -719,13 +719,13 @@ class ShiftLoss(nn.Module):
     """
     跨模态平移预测损失
     
-    使用 Smooth L1 Loss，在误差较大时提供稳定梯度，在误差接近0时更加平滑
+    使用 Smooth L1 Loss，不进行归一化（避免 Loss 过小）
     """
     
     def __init__(self, max_shift=50.0, loss_weight=1.0):
         """
         Args:
-            max_shift: 最大平移量（用于归一化）
+            max_shift: 最大平移量（仅用于日志参考）
             loss_weight: 损失权重
         """
         super().__init__()
@@ -735,15 +735,12 @@ class ShiftLoss(nn.Module):
     def forward(self, pred_shift, gt_shift):
         """
         Args:
-            pred_shift: (B, 2) 预测的 [dx, dy]
-            gt_shift: (B, 2) 真实的 [dx, dy]
+            pred_shift: (B, 2) 预测的 [dx, dy]，像素单位
+            gt_shift: (B, 2) 真实的 [dx, dy]，像素单位
         Returns:
             loss: 标量损失
         """
-        # 归一化到 [-1, 1] 范围
-        pred_norm = pred_shift / self.max_shift
-        gt_norm = gt_shift / self.max_shift
-        
-        # 使用 Smooth L1 Loss
-        loss = F.smooth_l1_loss(pred_norm, gt_norm)
+        # 直接使用像素单位的 Smooth L1 Loss
+        # 不归一化，让 Loss 量级回到 1.0 左右
+        loss = F.smooth_l1_loss(pred_shift, gt_shift)
         return loss * self.loss_weight
