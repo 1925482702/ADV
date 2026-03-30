@@ -1583,7 +1583,6 @@ class PairedAlbumentations(Albumentations):
                 new_lwir = self.transform(image=im_lwir, bboxes=bboxes, class_labels=cls)  # transformed
                 if len(new["class_labels"]) > 0:  # skip update if no bbox in new im
                     labels["img"] = np.concatenate((new["image"], new_lwir["image"]), axis=2)
-                    labels["img"] = new["image"]
                     # labels["img_lwir"] = new_lwir["image"]
                     labels["cls"] = np.array(new["class_labels"])
                     bboxes = np.array(new["bboxes"], dtype=np.float32)

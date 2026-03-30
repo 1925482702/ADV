@@ -14,7 +14,7 @@ import sys
 import os
 
 # Add ultralytics to path
-sys.path.insert(0, '/root/autodl-tmp/ADV/M2D-LIF')
+sys.path.insert(0, '/mnt/home/pyq_code/ADV/M2D-LIF')
 
 from ultralytics import YOLO
 
@@ -106,20 +106,20 @@ def main():
     parser.add_argument('--batch', type=int, default=16, help='Batch size')
     parser.add_argument('--device', type=int, default=0, help='CUDA device')
     parser.add_argument('--rgb-weight', type=str, 
-                        default='/root/autodl-tmp/ADV/checkpoint/monomodal/FLIR_rgb.pt',
+                        default='/mnt/home/pyq_code/ADV/checkpoint/monomodal/FLIR_rgb.pt',
                         help='Path to RGB teacher checkpoint')
     parser.add_argument('--ir-weight', type=str,
-                        default='/root/autodl-tmp/ADV/checkpoint/monomodal/FLIR_ir.pt',
+                        default='/mnt/home/pyq_code/ADV/checkpoint/monomodal/FLIR_ir.pt',
                         help='Path to IR teacher checkpoint')
     args = parser.parse_args()
     
     # Model config (use scale-specific yaml)
-    model_yaml = f"/root/autodl-tmp/ADV/M2D-LIF/model_yaml/yolov8_dual_frozen_{args.scale}.yaml"
+    model_yaml = f"/mnt/home/pyq_code/ADV/M2D-LIF/model_yaml/yolov8_dual_frozen_{args.scale}.yaml"
     
     # Check if scale-specific yaml exists
     import os
     if not os.path.exists(model_yaml):
-        model_yaml = "/root/autodl-tmp/ADV/M2D-LIF/model_yaml/yolov8_dual_frozen.yaml"
+        model_yaml = "/mnt/home/pyq_code/ADV/M2D-LIF/model_yaml/yolov8_dual_frozen.yaml"
         print(f"[WARNING] Scale-specific yaml not found, using default: {model_yaml}")
     
     print(f"[INFO] Model config: {model_yaml}")
@@ -137,16 +137,16 @@ def main():
     print("\n[INFO] Starting training...")
     model.train(
         task='detect',
-        data="/root/autodl-tmp/ADV/M2D-LIF/data/FLIR.yaml",
+        data="/mnt/home/pyq_code/ADV/M2D-LIF/data/FLIR.yaml",
         epochs=args.epochs,
         imgsz=640,
         device=args.device,
         batch=args.batch,
-        workers=8,
+        workers=1,
         project='./runs/frozen_teacher',
-        name=f'yolov8{args.scale}_frozen_5layer',
+        name=f'yolov8{args.scale}_frozen_add',
         lr0=0.01,
-        augment=True
+        augment=False
     )
 
 
