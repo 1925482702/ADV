@@ -203,9 +203,6 @@ class YOLODataset(BaseDataset):
                 value = torch.stack(value, 0)
             if k in ['masks', 'keypoints', 'bboxes', 'cls', 'segments', 'obb']:
                 value = torch.cat(value, 0)
-            # 处理 shift 字段（跨模态平移预测任务的 GT）
-            if k in ['shift_dx', 'shift_dy']:
-                value = torch.tensor(value, dtype=torch.float32)
             new_batch[k] = value
         new_batch['batch_idx'] = list(new_batch['batch_idx'])
         for i in range(len(new_batch['batch_idx'])):

@@ -1,0 +1,32 @@
+# 激进配置 - 强对齐约束
+
+# 数据增强参数
+shift_range: [20, 80]     # 大平移
+shift_prob: 0.5           # 高概率
+
+# Loss参数
+shift_weight: 0.2         # 强权重
+shift_enabled: true
+
+# 训练参数
+model: yolov8n.yaml
+epochs: 150
+imgsz: 640
+batch: 32
+device: 0
+workers: 4
+
+# 学习率
+lr0: 0.01
+momentum: 0.937
+weight_decay: 0.0005
+seed: 42
+
+# 输出
+project: runs/shift_training
+save: true
+verbose: true
+
+# 其他
+patience: 50
+augment: true

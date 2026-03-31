@@ -21,6 +21,9 @@ from .block import *
 from .conv import (Add, CBAM, ChannelAttention, Concat, Conv, Conv2, ConvTranspose, DWConv, DWConvTranspose2d, Focus,
                    GhostConv, LightConv, RepConv, SpatialAttention)
 from .head import OBB, Classify, Detect, Pose, RTDETRDecoder, Segment
+# NOTE: ShiftHead is NOT imported here on purpose — it must stay out of
+# the parse_model namespace so YAML model building doesn't pick it up.
+# Import it directly: from ultralytics.nn.modules.shift import ShiftHead
 from .transformer import (AIFI, MLP, DeformableTransformerDecoder, DeformableTransformerDecoderLayer, LayerNorm2d,
                           MLPBlock, MSDeformAttn, TransformerBlock, TransformerEncoderLayer, TransformerLayer)
 

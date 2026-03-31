@@ -1,0 +1,32 @@
+# 平衡配置 - 中等对齐约束（推荐）
+
+# 数据增强参数
+shift_range: [10, 50]     # 中等平移
+shift_prob: 0.3           # 中等概率
+
+# Loss参数
+shift_weight: 0.1         # 中等权重
+shift_enabled: true
+
+# 训练参数
+model: yolov8n.yaml
+epochs: 100
+imgsz: 640
+batch: 16
+device: 0
+workers: 4
+
+# 学习率
+lr0: 0.01
+momentum: 0.937
+weight_decay: 0.0005
+seed: 42
+
+# 输出
+project: runs/shift_training
+save: true
+verbose: true
+
+# 其他
+patience: 50
+augment: true

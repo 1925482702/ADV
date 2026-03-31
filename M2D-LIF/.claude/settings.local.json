@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls:*)",
+      "Bash(chmod -R u+w /home/aknodb/code/ADV/M2D-LIF/ultralytics/)",
+      "Bash(python:*)",
+      "Bash(python3:*)"
+    ]
+  }
+}

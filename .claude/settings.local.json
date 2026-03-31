@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \":*)",
+      "Bash(python:*)",
+      "Bash(cat:*)",
+      "Bash(/mnt/home/pyq_code/ADV/M2D-LIF/configs/shift_conservative.yaml:*)",
+      "Bash(__NEW_LINE_ab5381f3cad33ad8__ cat:*)",
+      "Bash(/mnt/home/pyq_code/ADV/M2D-LIF/configs/shift_balanced.yaml:*)",
+      "Bash(/mnt/home/pyq_code/ADV/M2D-LIF/configs/shift_aggressive.yaml:*)",
+      "Bash(__NEW_LINE_ab5381f3cad33ad8__ mkdir:*)",
+      "Bash(__NEW_LINE_fb164d801717e08d__ cat:*)",
+      "Bash(__NEW_LINE_fb164d801717e08d__ echo:*)",
+      "Bash(/mnt/home/pyq_code/ADV/M2D-LIF/TRAIN_SHIFT_QUICK_START.md:*)",
+      "Bash(__NEW_LINE_874104650191a554__ cat:*)",
+      "Bash(xxd)"
+    ]
+  }
+}
