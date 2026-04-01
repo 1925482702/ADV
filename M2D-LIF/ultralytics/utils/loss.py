@@ -429,11 +429,11 @@ class v8ShiftDetectionLoss(v8DetectionLoss):
                         shift_gt_fg[valid_shift],
                         reduction='mean'
                     )
-                    loss[3] = shift_loss * self.shift_weight * 100  # 放大100倍确保输出
+                    loss[3] = shift_loss * self.shift_weight
             else:
                 # 如果没有 shift_mask，对所有正样本计算
                 shift_loss = F.smooth_l1_loss(pred_shift_fg, shift_gt_fg, reduction='mean')
-                loss[3] = shift_loss * self.shift_weight * 100  # 放大100倍确保输出
+                loss[3] = shift_loss * self.shift_weight
         
         # 应用权重
         loss[0] *= self.hyp.box

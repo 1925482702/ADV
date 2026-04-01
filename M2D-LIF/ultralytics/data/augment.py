@@ -2386,7 +2386,8 @@ class ObjectShift(BaseTransform):
                 rgb, ir, bbox, h, w, shift_modality
             )
             if shift_dx is not None:
-                labels['shift_gt'][idx] = [shift_dx, shift_dy]
+                # 存储像素级 shift GT（shift_dx, shift_dy 是归一化值，乘以 w, h 转为像素级）
+                labels['shift_gt'][idx] = [shift_dx * w, shift_dy * h]
                 labels['shift_mask'][idx] = 1.0
         
         # 重新拼接图像
