@@ -8,10 +8,9 @@ import torch
 import torch.nn as nn
 
 from ultralytics.nn.modules import *
-from ultralytics.nn.modules.shift import ShiftHead
 from ultralytics.utils import DEFAULT_CFG_DICT, DEFAULT_CFG_KEYS, LOGGER, colorstr, emojis, yaml_load
 from ultralytics.utils.checks import check_requirements, check_suffix, check_yaml
-from ultralytics.utils.loss import v8ClassificationLoss, v8DetectionLoss, v8OBBLoss, v8PoseLoss, v8SegmentationLoss
+from ultralytics.utils.loss import v8ClassificationLoss, v8DetectionLoss, v8OBBLoss, v8PoseLoss, v8SegmentationLoss, v8ShiftDetectionLoss
 from ultralytics.utils.plotting import feature_visualization
 from ultralytics.utils.torch_utils import (fuse_conv_and_bn, fuse_deconv_and_bn, initialize_weights, intersect_dicts,
                                            make_divisible, model_info, scale_img, time_sync)
@@ -358,6 +357,18 @@ class DetectionModel(BaseModel):
     def init_criterion(self):
         """Initialize the loss criterion for the DetectionModel."""
         return v8DetectionLoss(self)
+
+
+class ShiftDetectionModel(DetectionModel):
+    """YOLOv8 Shift Detection model for cross-modal alignment."""
+    
+    def __init__(self, cfg='yolov8_shift.yaml', ch=6, nc=None, verbose=True):
+        """Initialize YOLOv8 Shift Detection model."""
+        super().__init__(cfg=cfg, ch=ch, nc=nc, verbose=verbose)
+    
+    def init_criterion(self):
+        """Initialize the loss criterion for ShiftDetectionModel."""
+        return v8ShiftDetectionLoss(self)
 
 
 class OBBModel(DetectionModel):
@@ -797,15 +808,12 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             args = [ch[f]]
         elif m is Concat:
             c2 = sum(ch[x] for x in f)
-        elif m in (Detect, Segment, Pose, OBB):
+        elif m in (Detect, Segment, Pose, OBB, ShiftDetect):
             args.append([ch[x] for x in f])
             if m is Segment:
                 args[2] = make_divisible(min(args[2], max_channels) * width, 8)
         elif m is RTDETRDecoder:  # special case, channels arg must be passed in index 1
             args.insert(1, [ch[x] for x in f])
-        elif m is ShiftHead:
-            c2 = 2  # output channels: dx, dy
-            args = [ch[f]]
         else:
             c2 = ch[f]
         print(m)

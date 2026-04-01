@@ -115,7 +115,11 @@ class BaseValidator:
             model = model.half() if self.args.half else model.float()
             # self.model = model
             self.loss = torch.zeros_like(trainer.loss_items, device=trainer.device)
-            if self.loss.shape[0] != 3:
+            # 检查是否是 ShiftDetectionTrainer（有 4 个 loss）
+            if hasattr(trainer, 'loss_names') and len(trainer.loss_names) == 4:
+                # 保留 4 个 loss 项
+                pass
+            elif self.loss.shape[0] != 3:
                 self.loss = self.loss[0:3]
             self.args.plots &= trainer.stopper.possible_stop or (trainer.epoch == trainer.epochs - 1)
             model.eval()

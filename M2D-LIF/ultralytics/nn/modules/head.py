@@ -14,7 +14,7 @@ from .conv import Conv
 from .transformer import MLP, DeformableTransformerDecoder, DeformableTransformerDecoderLayer
 from .utils import bias_init_with_prob, linear_init_
 
-__all__ = {'Detect', 'Segment', 'Pose', 'Classify', 'OBB', 'RTDETRDecoder'}
+__all__ = {'Detect', 'Segment', 'Pose', 'Classify', 'OBB', 'RTDETRDecoder', 'ShiftDetect'}
 
 
 
@@ -155,6 +155,93 @@ class OBB(Detect):
     def decode_bboxes(self, bboxes):
         """Decode rotated bounding boxes."""
         return dist2rbox(self.dfl(bboxes), self.angle, self.anchors.unsqueeze(0), dim=1) * self.strides
+
+
+class ShiftDetect(Detect):
+    """
+    YOLOv8 Detect head with object-level shift prediction for cross-modal alignment.
+    
+    每个物体输出：
+    - 检测框 (原任务)
+    - 类别 (原任务)
+    - shift (dx, dy) - 物体在两个模态间的空间偏移
+    
+    用于强制模型进行跨模态交互，解决模态不平衡问题
+    """
+    
+    def __init__(self, nc=80, ch=()):
+        """
+        初始化 ShiftDetect
+        
+        Args:
+            nc: 类别数
+            ch: 输入通道列表
+        """
+        super().__init__(nc, ch)
+        # Shift 预测分支：每个 anchor 预测 dx, dy
+        c_shift = max(16, ch[0] // 4)
+        self.cv_shift = nn.ModuleList(
+            nn.Sequential(
+                Conv(x, c_shift, 3), 
+                Conv(c_shift, c_shift, 3), 
+                nn.Conv2d(c_shift, 2, 1)  # 输出 dx, dy
+            ) for x in ch
+        )
+        # 输出通道数：训练时 box + cls + shift，推理时 box + cls
+        self.no_train = nc + self.reg_max * 4 + 2
+        self.no_infer = nc + self.reg_max * 4
+        self.no = self.no_train
+    
+    def forward(self, x):
+        """
+        前向传播
+        
+        Returns:
+            训练时: (检测特征)
+            推理时: ((检测结果, 中间特征))
+        """
+        # 处理可能的额外输入
+        if len(x) > 3:
+            x = x[3:]
+        
+        # 对每个尺度进行预测
+        shift_preds = []
+        for i in range(self.nl):
+            shift_i = self.cv_shift[i](x[i])  # [B, 2, H, W]
+            shift_preds.append(shift_i)
+            # 拼接: [box_reg, cls, shift]
+            x[i] = torch.cat((
+                self.cv2[i](x[i]),      # box: [B, reg_max*4, H, W]
+                self.cv3[i](x[i]),      # cls: [B, nc, H, W]
+                shift_i                 # shift: [B, 2, H, W]
+            ), 1)
+        
+        if self.training:
+            # 训练时返回所有尺度的特征（包含 shift）
+            return x
+        
+        # 推理时
+        shape = x[0].shape  # BCHW
+        # 先分离出 box 和 cls，不使用 shift
+        x_cat = []
+        for xi in x:
+            # xi 的形状是 [B, no_train, H, W]，其中 no_train = nc + reg_max*4 + 2
+            # 我们只需要前 no_infer 个通道：box + cls
+            xi_no_shift = xi[:, :self.no_infer, :, :]  # [B, nc + reg_max*4, H, W]
+            x_cat.append(xi_no_shift.view(shape[0], self.no_infer, -1))
+        x_cat = torch.cat(x_cat, 2)  # [B, nc + reg_max*4, total_anchors]
+        
+        if self.dynamic or self.shape != shape:
+            self.anchors, self.strides = (xx.transpose(0, 1) for xx in make_anchors(x, self.stride, 0.5))
+            self.shape = shape
+        
+        # 分离 box, cls
+        box, cls = x_cat.split((self.reg_max * 4, self.nc), 1)
+        dbox = self.decode_bboxes(box)
+        
+        # 推理时只输出 box 和 cls，不输出 shift
+        y = torch.cat((dbox, cls.sigmoid()), 1)
+        return (y, x)
 
 
 class Pose(Detect):

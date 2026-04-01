@@ -124,3 +124,8 @@ cfg:  # (str, optional) for overriding defaults.yaml
 # Tracker settings ------------------------------------------------------------------------------------------------------
 tracker: botsort.yaml  # (str) tracker type, choices=[botsort.yaml, bytetrack.yaml]
 distill_type : False
+
+# Shift Detection Module Parameters ------------------------------------------------------------------------------------
+shift_weight: 1.0  # (float) shift loss 的权重 λ
+shift_ratio: 0.3  # (float) 被平移物体的比例 (渐进式训练中动态调整)
+max_shift: 0.1  # (float) 最大平移幅度 (相对于图像尺寸)

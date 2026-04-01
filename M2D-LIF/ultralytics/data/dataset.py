@@ -1,5 +1,6 @@
 # Ultralytics YOLO 🚀, AGPL-3.0 license
 import contextlib
+import random
 from itertools import repeat
 from multiprocessing.pool import ThreadPool
 from pathlib import Path
@@ -201,7 +202,7 @@ class YOLODataset(BaseDataset):
             value = values[i]
             if k == 'img':
                 value = torch.stack(value, 0)
-            if k in ['masks', 'keypoints', 'bboxes', 'cls', 'segments', 'obb']:
+            if k in ['masks', 'keypoints', 'bboxes', 'cls', 'segments', 'obb', 'shift_gt', 'shift_mask']:
                 value = torch.cat(value, 0)
             new_batch[k] = value
         new_batch['batch_idx'] = list(new_batch['batch_idx'])

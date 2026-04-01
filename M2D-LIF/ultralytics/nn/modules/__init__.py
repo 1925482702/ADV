@@ -20,10 +20,7 @@ Example:
 from .block import *
 from .conv import (Add, CBAM, ChannelAttention, Concat, Conv, Conv2, ConvTranspose, DWConv, DWConvTranspose2d, Focus,
                    GhostConv, LightConv, RepConv, SpatialAttention)
-from .head import OBB, Classify, Detect, Pose, RTDETRDecoder, Segment
-# NOTE: ShiftHead is NOT imported here on purpose — it must stay out of
-# the parse_model namespace so YAML model building doesn't pick it up.
-# Import it directly: from ultralytics.nn.modules.shift import ShiftHead
+from .head import OBB, Classify, Detect, Pose, RTDETRDecoder, Segment, ShiftDetect
 from .transformer import (AIFI, MLP, DeformableTransformerDecoder, DeformableTransformerDecoderLayer, LayerNorm2d,
                           MLPBlock, MSDeformAttn, TransformerBlock, TransformerEncoderLayer, TransformerLayer)
 
@@ -33,4 +30,4 @@ __all__ = ('Add', 'Conv', 'Conv2', 'LightConv', 'RepConv', 'DWConv', 'DWConvTran
            'C2f', 'C3x', 'C3TR', 'C3Ghost', 'GhostBottleneck', 'Bottleneck', 'BottleneckCSP', 'Proto', 'Detect',
            'Segment', 'Pose', 'Classify', 'TransformerEncoderLayer', 'RepC3', 'RTDETRDecoder', 'AIFI',
            'DeformableTransformerDecoder', 'DeformableTransformerDecoderLayer', 'MSDeformAttn', 'MLP', 'ResNetLayer',
-           'OBB', 'IN', 'Multiin', 'MF', 'LIF', 'LIFAdd')
+           'OBB', 'IN', 'Multiin', 'MF', 'LIF', 'LIFAdd', 'ShiftDetect')

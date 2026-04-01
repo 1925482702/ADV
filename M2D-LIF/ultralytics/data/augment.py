@@ -61,6 +61,7 @@ class BaseTransform:
         self.apply_image(labels)
         self.apply_instances(labels)
         self.apply_semantic(labels)
+        return labels
 
 
 class Compose:
@@ -348,10 +349,17 @@ class Mosaic(BaseMixTransform):
             return {}
         cls = []
         instances = []
+        shift_gt_list = []
+        shift_mask_list = []
         imgsz = self.imgsz * 2  # mosaic imgsz
         for labels in mosaic_labels:
             cls.append(labels["cls"])
             instances.append(labels["instances"])
+            # 保留 shift_gt 和 shift_mask
+            if "shift_gt" in labels:
+                shift_gt_list.append(labels["shift_gt"])
+            if "shift_mask" in labels:
+                shift_mask_list.append(labels["shift_mask"])
         # Final labels
         final_labels = {
             "im_file": mosaic_labels[0]["im_file"],
@@ -364,6 +372,15 @@ class Mosaic(BaseMixTransform):
         final_labels["instances"].clip(imgsz, imgsz)
         good = final_labels["instances"].remove_zero_area_boxes()
         final_labels["cls"] = final_labels["cls"][good]
+        
+        # 合并 shift_gt 和 shift_mask（如果存在）
+        if shift_gt_list and shift_mask_list:
+            shift_gt_all = np.concatenate(shift_gt_list, 0)
+            shift_mask_all = np.concatenate(shift_mask_list, 0)
+            # 根据 good mask 过滤
+            final_labels["shift_gt"] = shift_gt_all[good]
+            final_labels["shift_mask"] = shift_mask_all[good]
+        
         if "texts" in mosaic_labels[0]:
             final_labels["texts"] = mosaic_labels[0]["texts"]
         return final_labels
@@ -374,11 +391,11 @@ class PairedMosaic(BaseMixTransform):
 
     """
 
-    def __init__(self, dataset, imgsz=640, p=1.0, n=4):
+    def __init__(self, dataset, imgsz=640, p=1.0, n=4, pre_transform=None):
         """Initializes the object with a dataset, image size, probability, and border."""
         assert 0 <= p <= 1.0, f"The probability should be in range [0, 1], but got {p}."
         assert n in {4, 9}, "grid must be equal to 4 or 9."
-        super().__init__(dataset=dataset, p=p)
+        super().__init__(dataset=dataset, p=p, pre_transform=pre_transform)
         self.dataset = dataset
         self.imgsz = imgsz
         self.border = (-imgsz // 2, -imgsz // 2)  # width, height
@@ -549,10 +566,17 @@ class PairedMosaic(BaseMixTransform):
             return {}
         cls = []
         instances = []
+        shift_gt_list = []
+        shift_mask_list = []
         imgsz = self.imgsz * 2  # mosaic imgsz
         for labels in mosaic_labels:
             cls.append(labels["cls"])
             instances.append(labels["instances"])
+            # 保留 shift_gt 和 shift_mask
+            if "shift_gt" in labels:
+                shift_gt_list.append(labels["shift_gt"])
+            if "shift_mask" in labels:
+                shift_mask_list.append(labels["shift_mask"])
         # Final labels
         final_labels = {
             "im_file": mosaic_labels[0]["im_file"],
@@ -566,6 +590,15 @@ class PairedMosaic(BaseMixTransform):
         final_labels["instances"].clip(imgsz, imgsz)
         good = final_labels["instances"].remove_zero_area_boxes()
         final_labels["cls"] = final_labels["cls"][good]
+        
+        # 合并 shift_gt 和 shift_mask（如果存在）
+        if shift_gt_list and shift_mask_list:
+            shift_gt_all = np.concatenate(shift_gt_list, 0)
+            shift_mask_all = np.concatenate(shift_mask_list, 0)
+            # 根据 good mask 过滤
+            final_labels["shift_gt"] = shift_gt_all[good]
+            final_labels["shift_mask"] = shift_mask_all[good]
+        
         if "texts" in mosaic_labels[0]:
             final_labels["texts"] = mosaic_labels[0]["texts"]
         return final_labels
@@ -609,6 +642,27 @@ class PairedMixUp(MixUp):
         # labels["img_lwir"] = (labels["img_lwir"] * r + labels2["img_lwir"] * (1 - r)).astype(np.uint8)
         labels["instances"] = Instances.concatenate([labels["instances"], labels2["instances"]], axis=0)
         labels["cls"] = np.concatenate([labels["cls"], labels2["cls"]], 0)
+        
+        # 合并 shift_gt 和 shift_mask
+        shift_gt1 = labels.get("shift_gt", None)
+        shift_gt2 = labels2.get("shift_gt", None)
+        shift_mask1 = labels.get("shift_mask", None)
+        shift_mask2 = labels2.get("shift_mask", None)
+        
+        if shift_gt1 is not None and shift_gt2 is not None:
+            labels["shift_gt"] = np.concatenate([shift_gt1, shift_gt2], 0)
+        elif shift_gt1 is not None:
+            labels["shift_gt"] = shift_gt1
+        elif shift_gt2 is not None:
+            labels["shift_gt"] = shift_gt2
+        
+        if shift_mask1 is not None and shift_mask2 is not None:
+            labels["shift_mask"] = np.concatenate([shift_mask1, shift_mask2], 0)
+        elif shift_mask1 is not None:
+            labels["shift_mask"] = shift_mask1
+        elif shift_mask2 is not None:
+            labels["shift_mask"] = shift_mask2
+        
         return labels
 
 class RandomPerspective:
@@ -933,6 +987,11 @@ class PairedRandomPerspective(RandomPerspective):
 
         cls = labels["cls"]
         instances = labels.pop("instances")
+        
+        # 保留 shift_gt 和 shift_mask
+        shift_gt = labels.get("shift_gt", None)
+        shift_mask = labels.get("shift_mask", None)
+        
         # Make sure the coord formats are right
         instances.convert_bbox(format="xyxy")
         instances.denormalize(*img.shape[:2][::-1])
@@ -967,6 +1026,13 @@ class PairedRandomPerspective(RandomPerspective):
         )
         labels["instances"] = new_instances[i]
         labels["cls"] = cls[i]
+        
+        # 过滤 shift_gt 和 shift_mask
+        if shift_gt is not None:
+            labels["shift_gt"] = shift_gt[i]
+        if shift_mask is not None:
+            labels["shift_mask"] = shift_mask[i]
+        
         labels["img"] = np.concatenate((img, img_lwir), axis=2)
         # labels["img_lwir"] = img_lwir
         labels["resized_shape"] = img.shape[:2]
@@ -1439,6 +1505,11 @@ class PairedCopyPaste(CopyPaste):
         cls = labels["cls"]
         h, w = im.shape[:2]
         instances = labels.pop("instances")
+        
+        # 保留 shift_gt 和 shift_mask
+        shift_gt = labels.get("shift_gt", None)
+        shift_mask = labels.get("shift_mask", None)
+        
         instances.convert_bbox(format="xyxy")
         instances.denormalize(w, h)
         if self.p and len(instances.segments):
@@ -1459,6 +1530,12 @@ class PairedCopyPaste(CopyPaste):
                 instances = Instances.concatenate((instances, ins_flip[[j]]), axis=0)
                 cv2.drawContours(im_new, instances.segments[[j]].astype(np.int32), -1, (1, 1, 1), cv2.FILLED)
                 cv2.drawContours(im_new_lwir, instances.segments[[j]].astype(np.int32), -1, (1, 1, 1), cv2.FILLED)
+                
+                # 新添加的物体，shift_gt 和 shift_mask 应该为 0
+                if shift_gt is not None:
+                    shift_gt = np.concatenate([shift_gt, np.zeros((1, 2), dtype=np.float32)], axis=0)
+                if shift_mask is not None:
+                    shift_mask = np.concatenate([shift_mask, np.zeros((1,), dtype=np.float32)], axis=0)
 
             result = cv2.flip(im, 1)  # augment segments (flip left-right)
             result_lwir = cv2.flip(im_lwir, 1)  # augment segments (flip left-right)
@@ -1471,6 +1548,13 @@ class PairedCopyPaste(CopyPaste):
         # labels["img_lwir"] = im_lwir
         labels["cls"] = cls
         labels["instances"] = instances
+        
+        # 保留 shift_gt 和 shift_mask
+        if shift_gt is not None:
+            labels["shift_gt"] = shift_gt
+        if shift_mask is not None:
+            labels["shift_mask"] = shift_mask
+        
         return labels
 
 
@@ -1640,6 +1724,10 @@ class Format:
         instances.denormalize(w, h)
         nl = len(instances)
 
+        # 保留 shift_gt 和 shift_mask（如果存在）
+        shift_gt = labels.pop("shift_gt", None)
+        shift_mask = labels.pop("shift_mask", None)
+
         if self.return_mask:
             if nl:
                 masks, instances, cls = self._format_segments(instances, cls, w, h)
@@ -1668,6 +1756,13 @@ class Format:
         # Then we can use collate_fn
         if self.batch_idx:
             labels["batch_idx"] = torch.zeros(nl)
+        
+        # 添加 shift_gt 和 shift_mask 到 labels
+        if shift_gt is not None:
+            labels["shift_gt"] = torch.from_numpy(shift_gt) if nl else torch.zeros((nl, 2))
+        if shift_mask is not None:
+            labels["shift_mask"] = torch.from_numpy(shift_mask) if nl else torch.zeros(nl)
+        
         return labels
 
     def _format_img(self, img):
@@ -1771,15 +1866,6 @@ class PairedFormat:
         # Then we can use collate_fn
         if self.batch_idx:
             labels["batch_idx"] = torch.zeros(nl)
-
-        # Preserve shift information if present
-        if "shift_dx" not in labels:
-            labels["shift_dx"] = 0.0
-        if "shift_dy" not in labels:
-            labels["shift_dy"] = 0.0
-        if "shift_applied" not in labels:
-            labels["shift_applied"] = False
-
         return labels
 
     def _format_img(self, img):
@@ -1922,9 +2008,17 @@ def v8_transforms(dataset, imgsz, hyp, stretch=False):
 # pdb.set_trace()
 def v8_Pairedtransforms(dataset, imgsz, hyp, stretch=False):
     """Convert images to a size suitable for YOLOv8 training."""
+    # 添加 ObjectShift 增强来生成 shift_gt 和 shift_mask
+    shift_ratio = getattr(hyp, 'shift_ratio', 0.3)
+    max_shift = getattr(hyp, 'max_shift', 0.1)
+    
+    # 创建 ObjectShift 单独的 transform，用于 PairedMosaic 的 pre_transform
+    object_shift = ObjectShift(max_shift=max_shift, shift_ratio=shift_ratio, prob=1.0)
+    
     pre_transform = Compose(
         [
-            PairedMosaic(dataset, imgsz=imgsz, p=hyp.mosaic),
+            object_shift,  # 先应用 ObjectShift
+            PairedMosaic(dataset, imgsz=imgsz, p=hyp.mosaic, pre_transform=Compose([object_shift])),  # PairedMosaic 的 mix_labels 也会经过 ObjectShift
             PairedCopyPaste(p=hyp.copy_paste),
             PairedRandomPerspective(
                 degrees=hyp.degrees,
@@ -2207,374 +2301,190 @@ class ToTensor:
         return im
 
 
-class ShiftAugment:
-    """Cross-modal shift augmentation for RGB and IR modality alignment.
-
-    This class implements the shift augmentation strategy where RGB and IR images
-    are shifted independently, forcing the model to align objects across modalities.
+class ObjectShift(BaseTransform):
     """
-
-    def __init__(self, shift_range=(10, 50), shift_prob=0.3):
-        """Initialize ShiftAugment.
-
-        Args:
-            shift_range (tuple): Min and max pixel shift distance, default (10, 50)
-            shift_prob (float): Probability of applying shift, default 0.3
-        """
-        self.shift_range = shift_range
-        self.shift_prob = shift_prob
-
-    def __call__(self, labels):
-        """Apply shift augmentation to labels.
-
-        Args:
-            labels (dict): Dictionary containing:
-                - 'img': numpy array (H, W, 6) for RGB+IR
-                - 'bboxes': normalized bboxes (N, 4)
-                - 'cls': class labels (N,)
-
-        Returns:
-            dict: Updated labels with shift information
-        """
-        if random.random() > self.shift_prob:
-            # No shift
-            labels['shift_dx'] = 0.0
-            labels['shift_dy'] = 0.0
-            labels['shift_applied'] = False
-            return labels
-
-        img = labels['img']  # (H, W, 6)
-        h, w = img.shape[:2]
-
-        # Check if bboxes are normalized or in pixel coordinates
-        bboxes = labels.get('bboxes', np.array([])).copy()
-        if bboxes.size == 0:
-            labels['shift_applied'] = False
-            return labels
-
-        bbox_max = bboxes.max()
-        is_normalized = bbox_max < 2.0
-
-        # Convert to pixel coordinates if needed
-        if is_normalized:
-            bboxes_pixel = bboxes.copy()
-            bboxes_pixel[:, [0, 2]] *= w
-            bboxes_pixel[:, [1, 3]] *= h
-        else:
-            bboxes_pixel = bboxes
-
-        # Filter large enough targets
-        areas = (bboxes_pixel[:, 2] - bboxes_pixel[:, 0]) * (bboxes_pixel[:, 3] - bboxes_pixel[:, 1])
-        if is_normalized:
-            min_area = 0.001 * w * h
-        else:
-            min_area = 100
-
-        valid_indices = np.where(areas > min_area)[0]
-        if len(valid_indices) == 0:
-            labels['shift_applied'] = False
-            return labels
-
-        # Select targets: largest + random
-        if len(valid_indices) > 1:
-            largest_idx = valid_indices[np.argmax(areas[valid_indices])]
-            random_idx = np.random.choice(valid_indices)
-            selected_indices = [largest_idx, random_idx]
-        else:
-            selected_indices = list(valid_indices)
-
-        # Apply independent shifts to RGB and IR
-        shift_range = self.shift_range
-        shift_dist_rgb = random.randint(shift_range[0], shift_range[1])
-        shift_dist_ir = random.randint(shift_range[0], shift_range[1])
-        shift_angle_rgb = random.uniform(0, 2 * np.pi)
-        shift_angle_ir = random.uniform(0, 2 * np.pi)
-
-        dx_rgb = shift_dist_rgb * np.cos(shift_angle_rgb)
-        dy_rgb = shift_dist_rgb * np.sin(shift_angle_rgb)
-        dx_ir = shift_dist_ir * np.cos(shift_angle_ir)
-        dy_ir = shift_dist_ir * np.sin(shift_angle_ir)
-
-        # Apply shifts
-        img_rgb = img[:, :, :3].copy()
-        img_ir = img[:, :, 3:].copy()
-
-        img_rgb = self._shift_image_and_fill(img_rgb, dx_rgb, dy_rgb)
-        img_ir = self._shift_image_and_fill(img_ir, dx_ir, dy_ir)
-
-        img = np.concatenate([img_rgb, img_ir], axis=2)
-        labels['img'] = img
-
-        # Calculate ground truth shift (relative offset)
-        dx_gt = np.mean([dx_rgb - dx_ir])
-        dy_gt = np.mean([dy_rgb - dy_ir])
-
-        # Normalize if original bboxes were normalized
-        if is_normalized:
-            dx_gt /= w
-            dy_gt /= h
-
-        labels['shift_dx'] = float(dx_gt)
-        labels['shift_dy'] = float(dy_gt)
-        labels['shift_applied'] = True
-
-        return labels
-
-    @staticmethod
-    def _shift_image_and_fill(img, dx, dy):
-        """Shift image and fill holes with mean pixel value.
-
-        Args:
-            img (np.ndarray): Input image (H, W, C)
-            dx (float): Horizontal shift in pixels
-            dy (float): Vertical shift in pixels
-
-        Returns:
-            np.ndarray: Shifted image with filled holes
-        """
-        h, w = img.shape[:2]
-        dx, dy = int(round(dx)), int(round(dy))
-
-        # Create output image
-        result = img.copy()
-
-        # Calculate source and target regions
-        if dx >= 0:
-            src_x_start, src_x_end = 0, w - dx
-            tgt_x_start, tgt_x_end = dx, w
-        else:
-            src_x_start, src_x_end = -dx, w
-            tgt_x_start, tgt_x_end = 0, w + dx
-
-        if dy >= 0:
-            src_y_start, src_y_end = 0, h - dy
-            tgt_y_start, tgt_y_end = dy, h
-        else:
-            src_y_start, src_y_end = -dy, h
-            tgt_y_start, tgt_y_end = 0, h + dy
-
-        # Perform shift
-        if (src_x_end > src_x_start) and (src_y_end > src_y_start):
-            result[tgt_y_start:tgt_y_end, tgt_x_start:tgt_x_end] = \
-                img[src_y_start:src_y_end, src_x_start:src_x_end]
-
-        # Fill holes with mean + Gaussian blur
-        hole_mask = np.zeros((h, w), dtype=bool)
-        if dx >= 0:
-            hole_mask[:, :dx] = True
-        else:
-            hole_mask[:, w + dx:] = True
-        if dy >= 0:
-            hole_mask[:dy, :] = True
-        else:
-            hole_mask[h + dy:, :] = True
-
-        # Fill with mean pixel value
-        if hole_mask.any():
-            mean_val = img[~hole_mask].mean(axis=0) if (~hole_mask).any() else np.zeros_like(img[0, 0])
-            result[hole_mask] = mean_val
-
-            # Apply Gaussian blur to smooth transitions
-            # Find the hole region and apply blur
-            try:
-                # Get bounding box of hole
-                y_indices, x_indices = np.where(hole_mask)
-                if len(y_indices) > 0:
-                    y1, y2 = y_indices.min(), y_indices.max() + 1
-                    x1, x2 = x_indices.min(), x_indices.max() + 1
-
-                    # Ensure minimum size for GaussianBlur
-                    min_size = 5
-                    if (y2 - y1) >= min_size and (x2 - x1) >= min_size:
-                        hole_region = result[y1:y2, x1:x2].copy()
-                        blurred = cv2.GaussianBlur(hole_region, (5, 5), 0)
-                        result[y1:y2, x1:x2] = blurred
-            except Exception:
-                pass  # If blur fails, just use the mean fill
-
-        return result
-
-
-class PairedShiftAugment:
-    """Paired shift augmentation for RGB and IR modalities.
-
-    Works with paired images where RGB and IR are in separate keys.
+    物体级平移增强类
+    
+    功能：
+    - 随机选取部分物体进行空间平移
+    - 随机选择一个模态（RGB 或 IR）进行平移，另一个模态保持不变
+    - 边界模糊填充空洞
+    - 检测框 GT 保持不变
+    - 为每个物体记录 shift GT (dx, dy)
+    
+    用于强制跨模态交互，解决模态不平衡问题
     """
-
-    def __init__(self, shift_range=(10, 50), shift_prob=0.3):
-        """Initialize PairedShiftAugment.
-
-        Args:
-            shift_range (tuple): Min and max pixel shift distance, default (10, 50)
-            shift_prob (float): Probability of applying shift, default 0.3
+    
+    def __init__(self, max_shift=0.1, shift_ratio=0.3, prob=0.5):
         """
-        self.shift_range = shift_range
-        self.shift_prob = shift_prob
-
-    def __call__(self, labels):
-        """Apply shift augmentation to paired labels.
-
+        初始化 ObjectShift
+        
         Args:
-            labels (dict): Dictionary containing:
-                - 'img': numpy array (H, W, 3) for RGB
-                - 'img_lwir': numpy array (H, W, 3) for IR
-                - 'instances': Instances object with bboxes
-
-        Returns:
-            dict: Updated labels with shift information
+            max_shift (float): 最大平移比例（相对于图像尺寸），默认 0.1 即 10%
+            shift_ratio (float): 被平移物体的比例，默认 0.3 即 30%
+            prob (float): 应用增强的概率，默认 0.5
         """
-        if random.random() > self.shift_prob:
-            # No shift
-            labels['shift_dx'] = 0.0
-            labels['shift_dy'] = 0.0
-            labels['shift_applied'] = False
-            return labels
-
-        img_rgb = labels.get('img', None)
-        img_ir = labels.get('img_lwir', None)
-
-        if img_rgb is None or img_ir is None:
-            labels['shift_applied'] = False
-            return labels
-
-        h, w = img_rgb.shape[:2]
-
-        # Get bboxes from instances
-        instances = labels.get('instances', None)
-        if instances is None or len(instances) == 0:
-            labels['shift_applied'] = False
-            return labels
-
-        bboxes = instances.bboxes.copy()
-
-        # Bboxes should be in normalized format at this point
-        bbox_max = bboxes.max() if bboxes.size > 0 else 0
-        is_normalized = bbox_max < 2.0
-
-        # Convert to pixel coordinates if needed
-        if is_normalized:
-            bboxes_pixel = bboxes.copy()
-            bboxes_pixel[:, [0, 2]] *= w
-            bboxes_pixel[:, [1, 3]] *= h
+        super().__init__()
+        self.max_shift = max_shift
+        self.shift_ratio = shift_ratio
+        self.prob = prob
+    
+    def apply_image(self, labels):
+        """对图像应用物体级平移"""
+        img = labels.get('img')
+        if img is None:
+            return
+        
+        # 转换为 numpy 数组（如果是 tensor）
+        if isinstance(img, torch.Tensor):
+            img = img.cpu().numpy()
+            if img.ndim == 3 and img.shape[0] == 6:  # [C, H, W] -> [H, W, C]
+                img = np.transpose(img, (1, 2, 0))
+        
+        h, w = img.shape[:2]
+        
+        # 获取 bboxes（可能是 numpy 数组或 Instances 对象）
+        bboxes = labels.get('bboxes')
+        if bboxes is None:
+            instances = labels.get('instances')
+            if instances is not None:
+                bboxes = instances.bboxes
+        if bboxes is None:
+            return
+        
+        # 转换为 numpy 数组
+        if isinstance(bboxes, torch.Tensor):
+            bboxes = bboxes.cpu().numpy()
+        
+        # 初始化 shift_gt 和 shift_mask
+        n_obj = len(bboxes) if bboxes is not None else 0
+        labels['shift_gt'] = np.zeros((n_obj, 2), dtype=np.float32)
+        labels['shift_mask'] = np.zeros(n_obj, dtype=np.float32)
+        
+        # 根据概率决定是否应用增强
+        if random.random() > self.prob or n_obj == 0:
+            return
+        
+        # 随机选择部分物体
+        n_shift = max(1, int(n_obj * self.shift_ratio))
+        shift_indices = random.sample(range(n_obj), min(n_shift, n_obj))
+        
+        # 随机选择平移哪个模态 (RGB 或 IR)
+        shift_modality = random.choice(['rgb', 'ir'])
+        
+        # 分离模态 (假设 img 是 [H, W, 6]，前3通道是RGB，后3通道是IR)
+        if img.shape[2] >= 6:
+            rgb = img[:, :, :3].copy()
+            ir = img[:, :, 3:6].copy()
         else:
-            bboxes_pixel = bboxes
-
-        # Filter large enough targets
-        areas = (bboxes_pixel[:, 2] - bboxes_pixel[:, 0]) * (bboxes_pixel[:, 3] - bboxes_pixel[:, 1])
-        if is_normalized:
-            min_area = 0.001 * w * h
-        else:
-            min_area = 100
-
-        valid_indices = np.where(areas > min_area)[0]
-        if len(valid_indices) == 0:
-            labels['shift_applied'] = False
-            return labels
-
-        # Apply independent shifts to RGB and IR
-        shift_range = self.shift_range
-        shift_dist_rgb = random.randint(shift_range[0], shift_range[1])
-        shift_dist_ir = random.randint(shift_range[0], shift_range[1])
-        shift_angle_rgb = random.uniform(0, 2 * np.pi)
-        shift_angle_ir = random.uniform(0, 2 * np.pi)
-
-        dx_rgb = shift_dist_rgb * np.cos(shift_angle_rgb)
-        dy_rgb = shift_dist_rgb * np.sin(shift_angle_rgb)
-        dx_ir = shift_dist_ir * np.cos(shift_angle_ir)
-        dy_ir = shift_dist_ir * np.sin(shift_angle_ir)
-
-        # Apply shifts
-        img_rgb = self._shift_image_and_fill(img_rgb, dx_rgb, dy_rgb)
-        img_ir = self._shift_image_and_fill(img_ir, dx_ir, dy_ir)
-
-        labels['img'] = img_rgb
-        labels['img_lwir'] = img_ir
-
-        # Calculate ground truth shift (relative offset)
-        dx_gt = float(dx_rgb - dx_ir)
-        dy_gt = float(dy_rgb - dy_ir)
-
-        # Normalize if original bboxes were normalized
-        if is_normalized:
-            dx_gt /= w
-            dy_gt /= h
-
-        labels['shift_dx'] = dx_gt
-        labels['shift_dy'] = dy_gt
-        labels['shift_applied'] = True
-
-        return labels
-
-    @staticmethod
-    def _shift_image_and_fill(img, dx, dy):
-        """Shift image and fill holes with mean pixel value.
-
+            # 单模态情况，不做平移
+            return
+        
+        for idx in shift_indices:
+            bbox = bboxes[idx]  # xywh 归一化坐标
+            shift_dx, shift_dy = self._shift_single_object(
+                rgb, ir, bbox, h, w, shift_modality
+            )
+            if shift_dx is not None:
+                labels['shift_gt'][idx] = [shift_dx, shift_dy]
+                labels['shift_mask'][idx] = 1.0
+        
+        # 重新拼接图像
+        labels['img'] = np.concatenate([rgb, ir], axis=2)
+    
+    def _shift_single_object(self, rgb, ir, bbox, h, w, shift_modality):
+        """
+        对单个物体进行平移
+        
         Args:
-            img (np.ndarray): Input image (H, W, C)
-            dx (float): Horizontal shift in pixels
-            dy (float): Vertical shift in pixels
-
+            rgb: RGB 图像 [H, W, 3]
+            ir: IR 图像 [H, W, 3]
+            bbox: 边界框 [cx, cy, bw, bh] 归一化坐标
+            h, w: 图像高度和宽度
+            shift_modality: 平移的模态 ('rgb' 或 'ir')
+        
         Returns:
-            np.ndarray: Shifted image with filled holes
+            shift_dx, shift_dy: 平移量（归一化）
+        """
+        cx, cy, bw, bh = bbox
+        cx_px, cy_px = int(cx * w), int(cy * h)
+        bw_px, bh_px = max(int(bw * w), 1), max(int(bh * h), 1)
+        
+        # 随机平移量（归一化）
+        shift_dx = random.uniform(-self.max_shift, self.max_shift)
+        shift_dy = random.uniform(-self.max_shift, self.max_shift)
+        dx_px, dy_px = int(shift_dx * w), int(shift_dy * h)
+        
+        # 计算原始边界框区域（像素坐标）
+        x1 = max(0, cx_px - bw_px // 2)
+        y1 = max(0, cy_px - bh_px // 2)
+        x2 = min(w, cx_px + bw_px // 2)
+        y2 = min(h, cy_px + bh_px // 2)
+        
+        if x2 <= x1 or y2 <= y1:
+            return None, None
+        
+        obj_w, obj_h = x2 - x1, y2 - y1
+        
+        # 新位置（确保在图像范围内）
+        new_x1 = np.clip(x1 + dx_px, 0, w - obj_w)
+        new_y1 = np.clip(y1 + dy_px, 0, h - obj_h)
+        new_x2 = new_x1 + obj_w
+        new_y2 = new_y1 + obj_h
+        
+        # 选择目标模态
+        if shift_modality == 'rgb':
+            target_img = rgb
+        else:
+            target_img = ir
+        
+        # 提取物体区域
+        obj_region = target_img[y1:y2, x1:x2].copy()
+        
+        # 填充原位置的空洞（边界模糊填充）
+        target_img[y1:y2, x1:x2] = self._blur_fill(target_img, x1, y1, x2, y2)
+        
+        # 粘贴到新位置
+        target_img[new_y1:new_y2, new_x1:new_x2] = obj_region
+        
+        return shift_dx, shift_dy
+    
+    def _blur_fill(self, img, x1, y1, x2, y2):
+        """
+        边界模糊填充空洞
+        
+        使用边界像素均值 + 高斯噪声填充被移除的物体区域
         """
         h, w = img.shape[:2]
-        dx, dy = int(round(dx)), int(round(dy))
-
-        # Create output image
-        result = img.copy()
-
-        # Calculate source and target regions
-        if dx >= 0:
-            src_x_start, src_x_end = 0, w - dx
-            tgt_x_start, tgt_x_end = dx, w
+        
+        # 收集边界像素
+        border_pixels = []
+        if y1 > 0:
+            border_pixels.append(img[y1-1, x1:x2].mean(axis=0))
+        if y2 < h:
+            border_pixels.append(img[y2, x1:x2].mean(axis=0))
+        if x1 > 0:
+            border_pixels.append(img[y1:y2, x1-1].mean(axis=0))
+        if x2 < w:
+            border_pixels.append(img[y1:y2, x2].mean(axis=0))
+        
+        if border_pixels:
+            fill_color = np.mean(border_pixels, axis=0)
         else:
-            src_x_start, src_x_end = -dx, w
-            tgt_x_start, tgt_x_end = 0, w + dx
-
-        if dy >= 0:
-            src_y_start, src_y_end = 0, h - dy
-            tgt_y_start, tgt_y_end = dy, h
-        else:
-            src_y_start, src_y_end = -dy, h
-            tgt_y_start, tgt_y_end = 0, h + dy
-
-        # Perform shift
-        if (src_x_end > src_x_start) and (src_y_end > src_y_start):
-            result[tgt_y_start:tgt_y_end, tgt_x_start:tgt_x_end] = \
-                img[src_y_start:src_y_end, src_x_start:src_x_end]
-
-        # Fill holes with mean + Gaussian blur
-        hole_mask = np.zeros((h, w), dtype=bool)
-        if dx >= 0:
-            hole_mask[:, :dx] = True
-        else:
-            hole_mask[:, w + dx:] = True
-        if dy >= 0:
-            hole_mask[:dy, :] = True
-        else:
-            hole_mask[h + dy:, :] = True
-
-        # Fill with mean pixel value
-        if hole_mask.any():
-            mean_val = img[~hole_mask].mean(axis=0) if (~hole_mask).any() else np.zeros_like(img[0, 0])
-            result[hole_mask] = mean_val
-
-            # Apply Gaussian blur to smooth transitions
-            # Find the hole region and apply blur
-            try:
-                # Get bounding box of hole
-                y_indices, x_indices = np.where(hole_mask)
-                if len(y_indices) > 0:
-                    y1, y2 = y_indices.min(), y_indices.max() + 1
-                    x1, x2 = x_indices.min(), x_indices.max() + 1
-
-                    # Ensure minimum size for GaussianBlur
-                    min_size = 5
-                    if (y2 - y1) >= min_size and (x2 - x1) >= min_size:
-                        hole_region = result[y1:y2, x1:x2].copy()
-                        blurred = cv2.GaussianBlur(hole_region, (5, 5), 0)
-                        result[y1:y2, x1:x2] = blurred
-            except Exception:
-                pass  # If blur fails, just use the mean fill
-
-        return result
+            fill_color = np.array([128.0, 128.0, 128.0])
+        
+        # 填充 + 高斯噪声
+        fill_h, fill_w = y2 - y1, x2 - x1
+        fill = np.ones((fill_h, fill_w, 3)) * fill_color
+        noise = np.random.normal(0, 10, fill.shape)
+        fill = np.clip(fill + noise, 0, 255).astype(img.dtype)
+        
+        return fill
+    
+    def apply_instances(self, labels):
+        """实例级变换（保持检测框不变）"""
+        pass  # 检测框保持原位，不做修改
+    
+    def apply_semantic(self, labels):
+        """语义分割变换（暂不处理）"""
+        pass
