@@ -566,17 +566,10 @@ class PairedMosaic(BaseMixTransform):
             return {}
         cls = []
         instances = []
-        shift_gt_list = []
-        shift_mask_list = []
         imgsz = self.imgsz * 2  # mosaic imgsz
         for labels in mosaic_labels:
             cls.append(labels["cls"])
             instances.append(labels["instances"])
-            # 保留 shift_gt 和 shift_mask
-            if "shift_gt" in labels:
-                shift_gt_list.append(labels["shift_gt"])
-            if "shift_mask" in labels:
-                shift_mask_list.append(labels["shift_mask"])
         # Final labels
         final_labels = {
             "im_file": mosaic_labels[0]["im_file"],
@@ -590,14 +583,6 @@ class PairedMosaic(BaseMixTransform):
         final_labels["instances"].clip(imgsz, imgsz)
         good = final_labels["instances"].remove_zero_area_boxes()
         final_labels["cls"] = final_labels["cls"][good]
-        
-        # 合并 shift_gt 和 shift_mask（如果存在）
-        if shift_gt_list and shift_mask_list:
-            shift_gt_all = np.concatenate(shift_gt_list, 0)
-            shift_mask_all = np.concatenate(shift_mask_list, 0)
-            # 根据 good mask 过滤
-            final_labels["shift_gt"] = shift_gt_all[good]
-            final_labels["shift_mask"] = shift_mask_all[good]
         
         if "texts" in mosaic_labels[0]:
             final_labels["texts"] = mosaic_labels[0]["texts"]
@@ -642,26 +627,6 @@ class PairedMixUp(MixUp):
         # labels["img_lwir"] = (labels["img_lwir"] * r + labels2["img_lwir"] * (1 - r)).astype(np.uint8)
         labels["instances"] = Instances.concatenate([labels["instances"], labels2["instances"]], axis=0)
         labels["cls"] = np.concatenate([labels["cls"], labels2["cls"]], 0)
-        
-        # 合并 shift_gt 和 shift_mask
-        shift_gt1 = labels.get("shift_gt", None)
-        shift_gt2 = labels2.get("shift_gt", None)
-        shift_mask1 = labels.get("shift_mask", None)
-        shift_mask2 = labels2.get("shift_mask", None)
-        
-        if shift_gt1 is not None and shift_gt2 is not None:
-            labels["shift_gt"] = np.concatenate([shift_gt1, shift_gt2], 0)
-        elif shift_gt1 is not None:
-            labels["shift_gt"] = shift_gt1
-        elif shift_gt2 is not None:
-            labels["shift_gt"] = shift_gt2
-        
-        if shift_mask1 is not None and shift_mask2 is not None:
-            labels["shift_mask"] = np.concatenate([shift_mask1, shift_mask2], 0)
-        elif shift_mask1 is not None:
-            labels["shift_mask"] = shift_mask1
-        elif shift_mask2 is not None:
-            labels["shift_mask"] = shift_mask2
         
         return labels
 
@@ -988,10 +953,6 @@ class PairedRandomPerspective(RandomPerspective):
         cls = labels["cls"]
         instances = labels.pop("instances")
         
-        # 保留 shift_gt 和 shift_mask
-        shift_gt = labels.get("shift_gt", None)
-        shift_mask = labels.get("shift_mask", None)
-        
         # Make sure the coord formats are right
         instances.convert_bbox(format="xyxy")
         instances.denormalize(*img.shape[:2][::-1])
@@ -1026,12 +987,6 @@ class PairedRandomPerspective(RandomPerspective):
         )
         labels["instances"] = new_instances[i]
         labels["cls"] = cls[i]
-        
-        # 过滤 shift_gt 和 shift_mask
-        if shift_gt is not None:
-            labels["shift_gt"] = shift_gt[i]
-        if shift_mask is not None:
-            labels["shift_mask"] = shift_mask[i]
         
         labels["img"] = np.concatenate((img, img_lwir), axis=2)
         # labels["img_lwir"] = img_lwir
@@ -1506,10 +1461,6 @@ class PairedCopyPaste(CopyPaste):
         h, w = im.shape[:2]
         instances = labels.pop("instances")
         
-        # 保留 shift_gt 和 shift_mask
-        shift_gt = labels.get("shift_gt", None)
-        shift_mask = labels.get("shift_mask", None)
-        
         instances.convert_bbox(format="xyxy")
         instances.denormalize(w, h)
         if self.p and len(instances.segments):
@@ -1530,12 +1481,6 @@ class PairedCopyPaste(CopyPaste):
                 instances = Instances.concatenate((instances, ins_flip[[j]]), axis=0)
                 cv2.drawContours(im_new, instances.segments[[j]].astype(np.int32), -1, (1, 1, 1), cv2.FILLED)
                 cv2.drawContours(im_new_lwir, instances.segments[[j]].astype(np.int32), -1, (1, 1, 1), cv2.FILLED)
-                
-                # 新添加的物体，shift_gt 和 shift_mask 应该为 0
-                if shift_gt is not None:
-                    shift_gt = np.concatenate([shift_gt, np.zeros((1, 2), dtype=np.float32)], axis=0)
-                if shift_mask is not None:
-                    shift_mask = np.concatenate([shift_mask, np.zeros((1,), dtype=np.float32)], axis=0)
 
             result = cv2.flip(im, 1)  # augment segments (flip left-right)
             result_lwir = cv2.flip(im_lwir, 1)  # augment segments (flip left-right)
@@ -1548,12 +1493,6 @@ class PairedCopyPaste(CopyPaste):
         # labels["img_lwir"] = im_lwir
         labels["cls"] = cls
         labels["instances"] = instances
-        
-        # 保留 shift_gt 和 shift_mask
-        if shift_gt is not None:
-            labels["shift_gt"] = shift_gt
-        if shift_mask is not None:
-            labels["shift_mask"] = shift_mask
         
         return labels
 
@@ -2008,17 +1947,14 @@ def v8_transforms(dataset, imgsz, hyp, stretch=False):
 # pdb.set_trace()
 def v8_Pairedtransforms(dataset, imgsz, hyp, stretch=False):
     """Convert images to a size suitable for YOLOv8 training."""
-    # 添加 ObjectShift 增强来生成 shift_gt 和 shift_mask
+    # ObjectShift 参数
     shift_ratio = getattr(hyp, 'shift_ratio', 0.3)
     max_shift = getattr(hyp, 'max_shift', 0.1)
     
-    # 创建 ObjectShift 单独的 transform，用于 PairedMosaic 的 pre_transform
-    object_shift = ObjectShift(max_shift=max_shift, shift_ratio=shift_ratio, prob=1.0)
-    
+    # 几何变换流程（不包含 ObjectShift）
     pre_transform = Compose(
         [
-            object_shift,  # 先应用 ObjectShift
-            PairedMosaic(dataset, imgsz=imgsz, p=hyp.mosaic, pre_transform=Compose([object_shift])),  # PairedMosaic 的 mix_labels 也会经过 ObjectShift
+            PairedMosaic(dataset, imgsz=imgsz, p=hyp.mosaic),
             PairedCopyPaste(p=hyp.copy_paste),
             PairedRandomPerspective(
                 degrees=hyp.degrees,
@@ -2031,13 +1967,10 @@ def v8_Pairedtransforms(dataset, imgsz, hyp, stretch=False):
         ]
     )
     flip_idx = dataset.data.get("flip_idx", [])  # for keypoints augmentation
-    # if dataset.use_keypoints:
-    #     kpt_shape = dataset.data.get("kpt_shape", None)
-    #     if len(flip_idx) == 0 and hyp.fliplr > 0.0:
-    #         hyp.fliplr = 0.0
-    #         LOGGER.warning("WARNING ⚠️ No 'flip_idx' array defined in data.yaml, setting augmentation 'fliplr=0.0'")
-    #     elif flip_idx and (len(flip_idx) != kpt_shape[0]):
-    #         raise ValueError(f"data.yaml flip_idx={flip_idx} length must be equal to kpt_shape[0]={kpt_shape[0]}")
+
+    # ObjectShift 放在所有几何变换之后，Format 之前
+    # 这样 shift_gt 就是最终图像上的像素偏移，无需维护坐标一致性
+    object_shift = ObjectShift(max_shift=max_shift, shift_ratio=shift_ratio, prob=1.0)
 
     return Compose(
         [
@@ -2047,6 +1980,7 @@ def v8_Pairedtransforms(dataset, imgsz, hyp, stretch=False):
             # PairedRandomHSV(hgain=hyp.hsv_h, sgain=hyp.hsv_s, vgain=hyp.hsv_v),
             PairedRandomFlip(direction="vertical", p=hyp.flipud),
             PairedRandomFlip(direction="horizontal", p=hyp.fliplr, flip_idx=flip_idx),
+            object_shift,  # 最后执行 ObjectShift
         ]
     )  # transforms
 
@@ -2387,7 +2321,7 @@ class ObjectShift(BaseTransform):
             )
             if shift_dx is not None:
                 # 存储像素级 shift GT（shift_dx, shift_dy 是归一化值，乘以 w, h 转为像素级）
-                labels['shift_gt'][idx] = [shift_dx * w, shift_dy * h]
+                labels['shift_gt'][idx] = [shift_dx, shift_dy]
                 labels['shift_mask'][idx] = 1.0
         
         # 重新拼接图像
