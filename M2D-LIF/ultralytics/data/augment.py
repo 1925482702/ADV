@@ -1949,7 +1949,7 @@ def v8_Pairedtransforms(dataset, imgsz, hyp, stretch=False):
     """Convert images to a size suitable for YOLOv8 training."""
     # ObjectShift 参数
     shift_ratio = getattr(hyp, 'shift_ratio', 0.3)
-    max_shift = getattr(hyp, 'max_shift', 0.1)
+    max_shift = getattr(hyp, 'max_shift', 0.2)
     
     # 几何变换流程（不包含 ObjectShift）
     pre_transform = Compose(
@@ -2237,31 +2237,37 @@ class ToTensor:
 
 class ObjectShift(BaseTransform):
     """
-    物体级平移增强类
+    物体级平移增强类 V2
     
     功能：
-    - 随机选取部分物体进行空间平移
+    - 随机选取部分物体进行空间平移（放大+复制粘贴，无空洞）
     - 随机选择一个模态（RGB 或 IR）进行平移，另一个模态保持不变
-    - 边界模糊填充空洞
+    - 背景区域同步打乱，防止模型识别割痕作弊
     - 检测框 GT 保持不变
-    - 为每个物体记录 shift GT (dx, dy)
+    - 为每个物体记录 shift GT (dx, dy) - 归一化值
     
     用于强制跨模态交互，解决模态不平衡问题
     """
     
-    def __init__(self, max_shift=0.1, shift_ratio=0.3, prob=0.5):
+    def __init__(self, max_shift=0.2, shift_ratio=0.3, prob=0.5, bg_max_attempts=50, min_shift_px=8, max_shift_px_limit=30):
         """
         初始化 ObjectShift
         
         Args:
-            max_shift (float): 最大平移比例（相对于图像尺寸），默认 0.1 即 10%
+            max_shift (float): 最大平移比例（相对于框尺寸），默认 0.2 即 20%
             shift_ratio (float): 被平移物体的比例，默认 0.3 即 30%
             prob (float): 应用增强的概率，默认 0.5
+            bg_max_attempts (int): 背景区域最大尝试次数，默认 50
+            min_shift_px (int): 最小平移量（像素），默认 8
+            max_shift_px_limit (int): 最大平移量（像素），默认 30
         """
         super().__init__()
         self.max_shift = max_shift
         self.shift_ratio = shift_ratio
         self.prob = prob
+        self.bg_max_attempts = bg_max_attempts
+        self.min_shift_px = min_shift_px
+        self.max_shift_px_limit = max_shift_px_limit
     
     def apply_image(self, labels):
         """对图像应用物体级平移"""
@@ -2276,6 +2282,11 @@ class ObjectShift(BaseTransform):
                 img = np.transpose(img, (1, 2, 0))
         
         h, w = img.shape[:2]
+        
+        # 调试：检查图像形状
+        if img.shape[2] < 6:
+            print(f"Warning: Image has {img.shape[2]} channels, expected 6. Shape: {img.shape}")
+            return
         
         # 获取 bboxes（可能是 numpy 数组或 Instances 对象）
         bboxes = labels.get('bboxes')
@@ -2296,15 +2307,15 @@ class ObjectShift(BaseTransform):
         labels['shift_mask'] = np.zeros(n_obj, dtype=np.float32)
         
         # 根据概率决定是否应用增强
-        if random.random() > self.prob or n_obj == 0:
+        if np.random.random() > self.prob or n_obj == 0:
             return
         
         # 随机选择部分物体
         n_shift = max(1, int(n_obj * self.shift_ratio))
-        shift_indices = random.sample(range(n_obj), min(n_shift, n_obj))
+        shift_indices = np.random.choice(n_obj, size=min(n_shift, n_obj), replace=False).tolist()
         
         # 随机选择平移哪个模态 (RGB 或 IR)
-        shift_modality = random.choice(['rgb', 'ir'])
+        shift_modality = np.random.choice(['rgb', 'ir'])
         
         # 分离模态 (假设 img 是 [H, W, 6]，前3通道是RGB，后3通道是IR)
         if img.shape[2] >= 6:
@@ -2314,111 +2325,323 @@ class ObjectShift(BaseTransform):
             # 单模态情况，不做平移
             return
         
+        # 选择目标模态
+        target_img = rgb if shift_modality == 'rgb' else ir
+        
+        # 处理物体平移
+        valid_shifts = []
+        shift_info = []  # 记录平移信息：[(idx, shift_dx, shift_dy, bbox, actual_bbox_px), ...]
         for idx in shift_indices:
             bbox = bboxes[idx]  # xywh 归一化坐标
-            shift_dx, shift_dy = self._shift_single_object(
-                rgb, ir, bbox, h, w, shift_modality
-            )
-            if shift_dx is not None:
-                # 存储像素级 shift GT（shift_dx, shift_dy 是归一化值，乘以 w, h 转为像素级）
-                labels['shift_gt'][idx] = [shift_dx, shift_dy]
-                labels['shift_mask'][idx] = 1.0
+            result = self._shift_single_object_v2(target_img, bbox, h, w)
+            if result is not None:
+                shift_dx, shift_dy, actual_bbox_px = result
+                if shift_dx != 0 or shift_dy != 0:
+                    # 存储归一化 shift GT（不乘 w, h）
+                    labels['shift_gt'][idx] = [shift_dx, shift_dy]
+                    labels['shift_mask'][idx] = 1.0
+                    valid_shifts.append((shift_dx, shift_dy))
+                    shift_info.append((idx, shift_dx, shift_dy, bbox, actual_bbox_px))
+        
+        # 背景打乱（已注释，只保留物体平移）
+        # if valid_shifts:
+        #     self._shuffle_background(target_img, bboxes, h, w, len(valid_shifts), shift_info)
         
         # 重新拼接图像
-        labels['img'] = np.concatenate([rgb, ir], axis=2)
+        # 确保图像不为空
+        if rgb is not None and ir is not None and rgb.shape == ir.shape:
+            labels['img'] = np.concatenate([rgb, ir], axis=2)
+        else:
+            # 如果图像为空，保持原始图像不变
+            pass
     
-    def _shift_single_object(self, rgb, ir, bbox, h, w, shift_modality):
+    def _shift_single_object_v2(self, target_img, bbox, h, w):
         """
-        对单个物体进行平移
+        对单个物体进行放大+复制粘贴平移（无空洞）
         
         Args:
-            rgb: RGB 图像 [H, W, 3]
-            ir: IR 图像 [H, W, 3]
+            target_img: 目标模态图像 [H, W, 3]
             bbox: 边界框 [cx, cy, bw, bh] 归一化坐标
             h, w: 图像高度和宽度
-            shift_modality: 平移的模态 ('rgb' 或 'ir')
         
         Returns:
-            shift_dx, shift_dy: 平移量（归一化）
+            (shift_dx, shift_dy, actual_bbox_px): 
+                shift_dx, shift_dy: 平移量（归一化）
+                actual_bbox_px: 实际粘贴后的bbox像素坐标 [x1, y1, x2, y2]
+                如果无法平移则返回 None
         """
         cx, cy, bw, bh = bbox
-        cx_px, cy_px = int(cx * w), int(cy * h)
-        bw_px, bh_px = max(int(bw * w), 1), max(int(bh * h), 1)
         
-        # 随机平移量（归一化）
-        shift_dx = random.uniform(-self.max_shift, self.max_shift)
-        shift_dy = random.uniform(-self.max_shift, self.max_shift)
-        dx_px, dy_px = int(shift_dx * w), int(shift_dy * h)
+        # 转换为像素坐标
+        cx_px = int(cx * w)
+        cy_px = int(cy * h)
+        bw_px = max(int(bw * w), 1)
+        bh_px = max(int(bh * h), 1)
         
-        # 计算原始边界框区域（像素坐标）
+        # 原始边界框区域
         x1 = max(0, cx_px - bw_px // 2)
         y1 = max(0, cy_px - bh_px // 2)
         x2 = min(w, cx_px + bw_px // 2)
         y2 = min(h, cy_px + bh_px // 2)
         
         if x2 <= x1 or y2 <= y1:
-            return None, None
+            return None
         
-        obj_w, obj_h = x2 - x1, y2 - y1
+        # 随机平移比例（相对于框尺寸）
+        shift_ratio_x = np.random.uniform(-self.max_shift, self.max_shift)
+        shift_ratio_y = np.random.uniform(-self.max_shift, self.max_shift)
         
-        # 新位置（确保在图像范围内）
-        new_x1 = np.clip(x1 + dx_px, 0, w - obj_w)
-        new_y1 = np.clip(y1 + dy_px, 0, h - obj_h)
-        new_x2 = new_x1 + obj_w
-        new_y2 = new_y1 + obj_h
+        # 初始平移量（像素）= 框尺寸 × shift_ratio
+        dx_px = int(bw_px * shift_ratio_x)
+        dy_px = int(bh_px * shift_ratio_y)
         
-        # 选择目标模态
-        if shift_modality == 'rgb':
-            target_img = rgb
-        else:
-            target_img = ir
+        # 相对阈值：物体尺寸的20%
+        min_shift_px_relative = int(min(bw_px, bh_px) * 0.2)
+        actual_min_shift_px = max(self.min_shift_px, min_shift_px_relative)
         
-        # 提取物体区域
-        obj_region = target_img[y1:y2, x1:x2].copy()
+        # 限制最小和最大平移量
+        dx_px = max(min(dx_px, self.max_shift_px_limit), -self.max_shift_px_limit)
+        dy_px = max(min(dy_px, self.max_shift_px_limit), -self.max_shift_px_limit)
+        if abs(dx_px) < actual_min_shift_px:
+            dx_px = actual_min_shift_px if dx_px >= 0 else -actual_min_shift_px
+        if abs(dy_px) < actual_min_shift_px:
+            dy_px = actual_min_shift_px if dy_px >= 0 else -actual_min_shift_px
         
-        # 填充原位置的空洞（边界模糊填充）
-        target_img[y1:y2, x1:x2] = self._blur_fill(target_img, x1, y1, x2, y2)
+        # ================== 自适应反向防越界 ==================
+        # 如果往右移(dx>0)左边不够挖，或者往左移(dx<0)右边不够挖 -> 尝试反向
+        if dx_px > 0 and x1 < abs(dx_px):
+            dx_px = -dx_px
+        elif dx_px < 0 and (w - x2) < abs(dx_px):
+            dx_px = -dx_px
+            
+        # 如果反向后还是不够挖（说明物体占满全图宽），强制取消X轴平移
+        if dx_px > 0 and x1 < abs(dx_px): dx_px = 0
+        elif dx_px < 0 and (w - x2) < abs(dx_px): dx_px = 0
+
+        # Y 轴同理
+        if dy_px > 0 and y1 < abs(dy_px):
+            dy_px = -dy_px
+        elif dy_px < 0 and (h - y2) < abs(dy_px):
+            dy_px = -dy_px
+            
+        if dy_px > 0 and y1 < abs(dy_px): dy_px = 0
+        elif dy_px < 0 and (h - y2) < abs(dy_px): dy_px = 0
         
-        # 粘贴到新位置
-        target_img[new_y1:new_y2, new_x1:new_x2] = obj_region
+        if dx_px == 0 and dy_px == 0:
+            return None
+
+        # ================== 利用 min/max 完美计算裁剪与粘贴框 ==================
+        # 裁剪框：如果是往右移(dx>0)，左侧边界 x1 要往左扩充 dx；往左移(dx<0)，右侧边界 x2 要往右扩充 |dx|
+        crop_x1 = max(0, x1 - max(dx_px, 0))
+        crop_y1 = max(0, y1 - max(dy_px, 0))
+        crop_x2 = min(w, x2 - min(dx_px, 0))
+        crop_y2 = min(h, y2 - min(dy_px, 0))
+
+        # 粘贴框：裁剪框的左上角，直接加上 dx_px, dy_px 就是粘贴的左上角！
+        paste_x1 = crop_x1 + dx_px
+        paste_y1 = crop_y1 + dy_px
+        paste_x2 = crop_x2 + dx_px
+        paste_y2 = crop_y2 + dy_px
+
+        # 目标区域截断处理（允许部分贴出图像边界，天然遮挡）
+        valid_paste_x1 = max(0, paste_x1)
+        valid_paste_y1 = max(0, paste_y1)
+        valid_paste_x2 = min(w, paste_x2)
+        valid_paste_y2 = min(h, paste_y2)
+
+        valid_w = valid_paste_x2 - valid_paste_x1
+        valid_h = valid_paste_y2 - valid_paste_y1
+
+        if valid_w <= 0 or valid_h <= 0:
+            return None
+
+        # 计算对应的有效裁剪区域
+        crop_start_x = valid_paste_x1 - paste_x1
+        crop_start_y = valid_paste_y1 - paste_y1
+        valid_crop_x1 = crop_x1 + crop_start_x
+        valid_crop_y1 = crop_y1 + crop_start_y
+        valid_crop_x2 = valid_crop_x1 + valid_w
+        valid_crop_y2 = valid_crop_y1 + valid_h
+
+        # 提取并覆盖
+        enlarged_region = target_img[valid_crop_y1:valid_crop_y2, valid_crop_x1:valid_crop_x2].copy()
+        target_img[valid_paste_y1:valid_paste_y2, valid_paste_x1:valid_paste_x2] = enlarged_region
         
-        return shift_dx, shift_dy
+        # 返回数据 (注意 shift_dx 和 shift_dy 是相对于整图宽高的比例，用于标签)
+        shift_dx = dx_px / w
+        shift_dy = dy_px / h
+        # actual_bbox 是真正物体的新位置，而不是粘贴框的位置
+        actual_bbox_px = [x1 + dx_px, y1 + dy_px, x2 + dx_px, y2 + dy_px] 
+        
+        return shift_dx, shift_dy, actual_bbox_px
     
-    def _blur_fill(self, img, x1, y1, x2, y2):
+    def _shuffle_background(self, target_img, bboxes, h, w, n_shift, shift_info):
         """
-        边界模糊填充空洞
+        背景打乱：在避开物体（包括原始位置和平移后位置）的区域执行同样的放大+复制粘贴
         
-        使用边界像素均值 + 高斯噪声填充被移除的物体区域
+        Args:
+            target_img: 目标模态图像 [H, W, 3]
+            bboxes: 所有物体的边界框 [N, 4] xywh 归一化坐标
+            h, w: 图像高度和宽度
+            n_shift: 被平移物体的数量
+            shift_info: 平移信息 [(idx, shift_dx, shift_dy, bbox, actual_bbox_px), ...]
+                          actual_bbox_px 是实际粘贴后的bbox像素坐标 [x1, y1, x2, y2]
         """
-        h, w = img.shape[:2]
+        # 目标背景区域数量
+        n_bg_target = int(n_shift * np.random.uniform(0.5, 1.5))
+        n_bg_success = 0
         
-        # 收集边界像素
-        border_pixels = []
-        if y1 > 0:
-            border_pixels.append(img[y1-1, x1:x2].mean(axis=0))
-        if y2 < h:
-            border_pixels.append(img[y2, x1:x2].mean(axis=0))
-        if x1 > 0:
-            border_pixels.append(img[y1:y2, x1-1].mean(axis=0))
-        if x2 < w:
-            border_pixels.append(img[y1:y2, x2].mean(axis=0))
+        # 背景区域大小范围
+        min_bg_size = min(h, w) // 15
+        max_bg_size = min(h, w) // 6
         
-        if border_pixels:
-            fill_color = np.mean(border_pixels, axis=0)
-        else:
-            fill_color = np.array([128.0, 128.0, 128.0])
+        for _ in range(self.bg_max_attempts):
+            if n_bg_success >= n_bg_target:
+                break
+            
+            # 随机生成背景区域大小
+            bg_w = np.random.randint(min_bg_size, max_bg_size + 1)
+            bg_h = np.random.randint(min_bg_size, max_bg_size + 1)
+            
+            # 随机生成背景区域位置
+            bg_x1 = np.random.randint(0, w - bg_w + 1)
+            bg_y1 = np.random.randint(0, h - bg_h + 1)
+            bg_x2 = bg_x1 + bg_w
+            bg_y2 = bg_y1 + bg_h
+            
+            # 预先计算背景区域的平移（与 _shift_background_region 中相同逻辑）
+            shift_dx = np.random.uniform(-self.max_shift, self.max_shift)
+            shift_dy = np.random.uniform(-self.max_shift, self.max_shift)
+            
+            # 计算平移后的位置（像素）
+            dx_px = int(shift_dx * w)
+            dy_px = int(shift_dy * h)
+            new_bg_x1 = bg_x1 + dx_px
+            new_bg_y1 = bg_y1 + dy_px
+            new_bg_x2 = new_bg_x1 + bg_w
+            new_bg_y2 = new_bg_y1 + bg_h
+            
+            # 检查原始位置是否与任何bbox重叠
+            if self._overlaps_with_bbox(bg_x1, bg_y1, bg_x2, bg_y2, bboxes, h, w, shift_info):
+                continue
+            
+            # 检查平移后位置是否与任何bbox重叠（包括原始位置和平移后的物体）
+            if self._overlaps_with_bbox(new_bg_x1, new_bg_y1, new_bg_x2, new_bg_y2, bboxes, h, w, shift_info):
+                continue
+            
+            # 对背景区域执行放大+复制粘贴（传入预先计算的shift量）
+            if self._shift_background_region(target_img, bg_x1, bg_y1, bg_w, bg_h, h, w, shift_dx, shift_dy):
+                n_bg_success += 1
+    
+    def _overlaps_with_bbox(self, x1, y1, x2, y2, bboxes, h, w, shift_info=None):
+        """
+        检查区域是否与任何bbox重叠（包括原始位置和平移后位置）
         
-        # 填充 + 高斯噪声
-        fill_h, fill_w = y2 - y1, x2 - x1
-        fill = np.ones((fill_h, fill_w, 3)) * fill_color
-        noise = np.random.normal(0, 10, fill.shape)
-        fill = np.clip(fill + noise, 0, 255).astype(img.dtype)
+        Args:
+            x1, y1, x2, y2: 区域的像素坐标
+            bboxes: 边界框 [N, 4] xywh 归一化坐标
+            h, w: 图像高度和宽度
+            shift_info: 平移信息 [(idx, shift_dx, shift_dy, bbox, actual_bbox_px), ...]
         
-        return fill
+        Returns:
+            bool: 是否重叠
+        """
+        # 检查是否与原始bbox重叠
+        for bbox in bboxes:
+            cx, cy, bw, bh = bbox
+            bbox_x1 = int((cx - bw / 2) * w)
+            bbox_y1 = int((cy - bh / 2) * h)
+            bbox_x2 = int((cx + bw / 2) * w)
+            bbox_y2 = int((cy + bh / 2) * h)
+            
+            # 检查重叠
+            if not (x2 < bbox_x1 or x1 > bbox_x2 or y2 < bbox_y1 or y1 > bbox_y2):
+                return True
+        
+        # 检查是否与平移后的bbox重叠（使用实际粘贴的bbox）
+        if shift_info:
+            for idx, shift_dx, shift_dy, bbox, actual_bbox_px in shift_info:
+                bbox_x1, bbox_y1, bbox_x2, bbox_y2 = actual_bbox_px
+                
+                # 检查重叠
+                if not (x2 < bbox_x1 or x1 > bbox_x2 or y2 < bbox_y1 or y1 > bbox_y2):
+                    return True
+        
+        return False
+    
+    def _shift_background_region(self, target_img, x1, y1, region_w, region_h, h, w, shift_dx=None, shift_dy=None):
+        """
+        对背景区域执行放大+复制粘贴
+        
+        Args:
+            target_img: 目标模态图像 [H, W, 3]
+            x1, y1: 区域左上角像素坐标
+            region_w, region_h: 区域宽高
+            h, w: 图像高度和宽度
+            shift_dx, shift_dy: 预先计算的平移量（归一化），如果为None则随机生成
+        
+        Returns:
+            bool: 是否成功执行
+        """
+        x2 = x1 + region_w
+        y2 = y1 + region_h
+        
+        if shift_dx is None:
+            shift_dx = np.random.uniform(-self.max_shift, self.max_shift)
+        if shift_dy is None:
+            shift_dy = np.random.uniform(-self.max_shift, self.max_shift)
+        
+        # 将传入的全图归一化比例转回像素
+        dx_px = int(shift_dx * w)
+        dy_px = int(shift_dy * h)
+        
+        if dx_px == 0 and dy_px == 0:
+            return False
+
+        # 检查源区域是否有足够的背景可挖，不够则直接跳过（背景要求比真实物体严格）
+        if dx_px > 0 and x1 < dx_px: return False
+        if dx_px < 0 and (w - x2) < abs(dx_px): return False
+        if dy_px > 0 and y1 < dy_px: return False
+        if dy_px < 0 and (h - y2) < abs(dy_px): return False
+
+        # 裁剪框与粘贴框计算
+        crop_x1 = max(0, x1 - max(dx_px, 0))
+        crop_y1 = max(0, y1 - max(dy_px, 0))
+        crop_x2 = min(w, x2 - min(dx_px, 0))
+        crop_y2 = min(h, y2 - min(dy_px, 0))
+
+        paste_x1 = crop_x1 + dx_px
+        paste_y1 = crop_y1 + dy_px
+        paste_x2 = crop_x2 + dx_px
+        paste_y2 = crop_y2 + dy_px
+
+        valid_paste_x1 = max(0, paste_x1)
+        valid_paste_y1 = max(0, paste_y1)
+        valid_paste_x2 = min(w, paste_x2)
+        valid_paste_y2 = min(h, paste_y2)
+
+        valid_w = valid_paste_x2 - valid_paste_x1
+        valid_h = valid_paste_y2 - valid_paste_y1
+
+        if valid_w <= 0 or valid_h <= 0:
+            return False
+
+        crop_start_x = valid_paste_x1 - paste_x1
+        crop_start_y = valid_paste_y1 - paste_y1
+        valid_crop_x1 = crop_x1 + crop_start_x
+        valid_crop_y1 = crop_y1 + crop_start_y
+        valid_crop_x2 = valid_crop_x1 + valid_w
+        valid_crop_y2 = valid_crop_y1 + valid_h
+
+        # 提取并覆盖
+        enlarged_region = target_img[valid_crop_y1:valid_crop_y2, valid_crop_x1:valid_crop_x2].copy()
+        target_img[valid_paste_y1:valid_paste_y2, valid_paste_x1:valid_paste_x2] = enlarged_region
+        
+        return True
     
     def apply_instances(self, labels):
         """实例级变换（保持检测框不变）"""
-        pass  # 检测框保持原位，不做修改
+        pass
     
     def apply_semantic(self, labels):
         """语义分割变换（暂不处理）"""
