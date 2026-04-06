@@ -14,7 +14,7 @@ from .conv import Conv
 from .transformer import MLP, DeformableTransformerDecoder, DeformableTransformerDecoderLayer
 from .utils import bias_init_with_prob, linear_init_
 
-__all__ = {'Detect', 'Segment', 'Pose', 'Classify', 'OBB', 'RTDETRDecoder', 'ShiftDetect'}
+__all__ = {'Detect', 'Segment', 'Pose', 'Classify', 'OBB', 'RTDETRDecoder', 'ShiftDetect', 'CrossModalShift', 'ShiftHead'}
 
 
 
@@ -532,3 +532,200 @@ class RTDETRDecoder(nn.Module):
         xavier_uniform_(self.query_pos_head.layers[1].weight)
         for layer in self.input_proj:
             xavier_uniform_(layer[0].weight)
+
+
+class CrossModalShift(nn.Module):
+    """
+    交叉注意力模块：对比两个模态的特征，预测空间偏移
+    
+    输入:
+        - rgb_feat: RGB 特征 [B, C, H, W]
+        - ir_feat: IR 特征 [B, C, H, W]
+        - shift_modality: [B] tensor, 0=RGB被平移(query=RGB), 1=IR被平移(query=IR)
+    
+    输出:
+        - shift_pred: 每个位置的偏移预测 [B, 2, H, W]
+    """
+    
+    def __init__(self, channels, num_heads=4, downsample=True):
+        super().__init__()
+        self.num_heads = num_heads
+        self.downsample = downsample
+        
+        # 可选：降采样以节省显存
+        if downsample:
+            self.down = nn.AvgPool2d(2, 2)
+            self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
+        
+        # Q, K, V 投影
+        self.q_proj = nn.Conv2d(channels, channels // 2, 1)
+        self.k_proj = nn.Conv2d(channels, channels // 2, 1)
+        self.v_proj = nn.Conv2d(channels, channels // 2, 1)
+        
+        self.out_proj = nn.Conv2d(channels // 2, channels, 1)
+        
+        # Shift 预测头
+        self.shift_head = nn.Sequential(
+            nn.Conv2d(channels * 3, channels, 3, padding=1),
+            nn.BatchNorm2d(channels),
+            nn.SiLU(),
+            nn.Conv2d(channels, channels // 2, 3, padding=1),
+            nn.BatchNorm2d(channels // 2),
+            nn.SiLU(),
+            nn.Conv2d(channels // 2, 2, 1)
+        )
+        
+        self.scale = (channels // 2 // num_heads) ** -0.5
+    
+    def forward(self, rgb_feat, ir_feat, shift_modality):
+        """
+        Args:
+            rgb_feat: RGB 特征 [B, C, H, W]
+            ir_feat: IR 特征 [B, C, H, W]
+            shift_modality: [B] tensor, 0=RGB被平移(query=RGB), 1=IR被平移(query=IR)
+
+        Returns:
+            shift_pred: [B, 2, H, W]
+        """
+        B, C, H, W = rgb_feat.shape
+
+        # 将 shift_modality 移动到与特征图相同的设备上
+        shift_modality = shift_modality.to(rgb_feat.device)
+
+        # 根据 shift_modality 确定 query 和 key/value
+        # shift_modality=0 → RGB被平移 → query=IR(基准), kv=RGB(被平移)
+        # shift_modality=1 → IR被平移 → query=RGB(基准), kv=IR(被平移)
+        # 使用未平移的模态作为基准（query），去另一个模态中检索被平移的物体
+
+        query_feat = torch.where(
+            shift_modality.view(B, 1, 1, 1).expand(-1, C, H, W) == 0,
+            ir_feat,   # RGB 被平移，用 IR 作为 query（基准）
+            rgb_feat   # IR 被平移，用 RGB 作为 query（基准）
+        )
+        kv_feat = torch.where(
+            shift_modality.view(B, 1, 1, 1).expand(-1, C, H, W) == 0,
+            rgb_feat,  # RGB 被平移，用 RGB 作为 kv（被平移的物体）
+            ir_feat   # IR 被平移，用 IR 作为 kv（被平移的物体）
+        )
+        
+        # 可选降采样
+        if self.downsample:
+            query_feat_down = self.down(query_feat)
+            kv_feat_down = self.down(kv_feat)
+            _, _, H_d, W_d = query_feat_down.shape
+        else:
+            query_feat_down = query_feat
+            kv_feat_down = kv_feat
+            H_d, W_d = H, W
+        
+        # 投影
+        q = self.q_proj(query_feat_down)
+        k = self.k_proj(kv_feat_down)
+        v = self.v_proj(kv_feat_down)
+        
+        # 多头注意力
+        q = q.view(B, self.num_heads, -1, H_d * W_d).transpose(-1, -2)
+        k = k.view(B, self.num_heads, -1, H_d * W_d).transpose(-1, -2)
+        v = v.view(B, self.num_heads, -1, H_d * W_d).transpose(-1, -2)
+        
+        # 注意力
+        attn = (q @ k.transpose(-1, -2)) * self.scale
+        attn = attn.softmax(dim=-1)
+        out = (attn @ v).transpose(-1, -2).contiguous().view(B, -1, H_d, W_d)
+        
+        attended_feat = self.out_proj(out)
+        
+        # 上采样恢复
+        if self.downsample:
+            attended_feat = self.up(attended_feat)
+        
+        # 特征差分
+        diff_feat = query_feat - kv_feat
+        
+        # 拼接预测
+        concat_feat = torch.cat([query_feat, attended_feat, diff_feat], dim=1)
+        shift_pred = self.shift_head(concat_feat)
+        
+        return shift_pred
+
+
+class ShiftHead(nn.Module):
+    """
+    独立的 Shift 预测头
+
+    接收三个尺度的 RGB 和 IR 独立特征，预测每个位置的跨模态偏移
+    使用交叉注意力显式对比两个模态的特征
+    """
+
+    def __init__(self, ch=()):
+        super().__init__()
+
+        # ch 会是一个包含 6 个元素的列表，对应 [rgb_p3, ir_p3, rgb_p4, ir_p4, rgb_p5, ir_p5] 的通道数
+        if len(ch) == 6:
+            # 提取 RGB 三个尺度的通道数 (比如 256, 512, 1024)
+            ch_rgb = (ch[0], ch[2], ch[4])
+            ch_ir = (ch[1], ch[3], ch[5])
+        else:
+            # 兜底默认值
+            ch_rgb = (256, 512, 1024)
+            ch_ir = (256, 512, 1024)
+
+        # 三个尺度的交叉注意力模块
+        self.shift_p3 = CrossModalShift(ch_rgb[0])
+        self.shift_p4 = CrossModalShift(ch_rgb[1])
+        self.shift_p5 = CrossModalShift(ch_rgb[2])
+
+        self.training = True
+
+        # 添加属性以兼容 v8DetectionLoss 的初始化逻辑
+        # 注意：这些属性只是为了欺骗损失函数初始化，实际计算时不会使用
+        import torch
+
+        # stride: ShiftHead 连接的是 P3, P4, P5 特征图，对应的下采样倍率是 8, 16, 32
+        self.stride = torch.tensor([8., 16., 32.])
+
+        # nc: 类别数（默认为80，从数据集获取）
+        self.nc = 80
+
+        # no: 输出通道数（ShiftHead 输出 dx, dy，所以是2）
+        self.no = 2
+
+        # reg_max: DFL 通道数（ShiftHead 不使用 DFL，设置为 0）
+        self.reg_max = 0
+
+        # nl: 层数量（3个尺度：P3, P4, P5）
+        self.nl = 3
+    
+    def forward(self, x):
+        """
+        Args:
+            x: [rgb_p3, ir_p3, rgb_p4, ir_p4, rgb_p5, ir_p5]
+               或者在推理时可能包含额外输入
+
+        Returns:
+            训练时: [shift_p3, shift_p4, shift_p5] 三个尺度的 shift 预测
+            推理时: None (不使用)
+        """
+        if len(x) < 6:
+            return None
+
+        rgb_p3, ir_p3, rgb_p4, ir_p4, rgb_p5, ir_p5 = x[:6]
+
+        if not self.training:
+            return None
+
+        # 1. 从自己身上取下刚才挂载的 shift_modality
+        modality = getattr(self, 'shift_modality', None)
+
+        # 兜底保护：如果在验证/推理时没有传入，默认全是 0 (RGB被平移)
+        if modality is None:
+            B = rgb_p3.shape[0]
+            import torch
+            modality = torch.zeros(B, device=rgb_p3.device, dtype=torch.long)
+
+        # 2. 把 modality 传给注意力模块
+        shift_p3 = self.shift_p3(rgb_p3, ir_p3, modality)  # [B, 2, H, W]
+        shift_p4 = self.shift_p4(rgb_p4, ir_p4, modality)
+        shift_p5 = self.shift_p5(rgb_p5, ir_p5, modality)
+
+        return [shift_p3, shift_p4, shift_p5]

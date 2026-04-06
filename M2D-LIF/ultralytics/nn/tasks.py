@@ -10,7 +10,7 @@ import torch.nn as nn
 from ultralytics.nn.modules import *
 from ultralytics.utils import DEFAULT_CFG_DICT, DEFAULT_CFG_KEYS, LOGGER, colorstr, emojis, yaml_load
 from ultralytics.utils.checks import check_requirements, check_suffix, check_yaml
-from ultralytics.utils.loss import v8ClassificationLoss, v8DetectionLoss, v8OBBLoss, v8PoseLoss, v8SegmentationLoss, v8ShiftDetectionLoss
+from ultralytics.utils.loss import v8ClassificationLoss, v8DetectionLoss, v8OBBLoss, v8PoseLoss, v8SegmentationLoss, v8ShiftDetectionLoss, v8ShiftDetectionLossV2
 from ultralytics.utils.plotting import feature_visualization
 from ultralytics.utils.torch_utils import (fuse_conv_and_bn, fuse_deconv_and_bn, initialize_weights, intersect_dicts,
                                            make_divisible, model_info, scale_img, time_sync)
@@ -361,11 +361,117 @@ class DetectionModel(BaseModel):
 
 class ShiftDetectionModel(DetectionModel):
     """YOLOv8 Shift Detection model for cross-modal alignment."""
-    
+
     def __init__(self, cfg='yolov8_shift.yaml', ch=6, nc=None, verbose=True):
         """Initialize YOLOv8 Shift Detection model."""
-        super().__init__(cfg=cfg, ch=ch, nc=nc, verbose=verbose)
-    
+        super().__init__()
+        self.yaml = cfg if isinstance(cfg, dict) else yaml_model_load(cfg)  # cfg dict
+
+        # Define model
+        ch = self.yaml['ch'] = self.yaml.get('ch', ch)  # input channels
+        if nc and nc != self.yaml['nc']:
+            LOGGER.info(f"Overriding model.yaml nc={self.yaml['nc']} with nc={nc}")
+            self.yaml['nc'] = nc  # override YAML value
+        self.model, self.save = parse_model(deepcopy(self.yaml), ch=ch, verbose=verbose)  # model, savelist
+        self.names = {i: f'{i}' for i in range(self.yaml['nc'])}  # default names dict
+        self.inplace = self.yaml.get('inplace', True)
+
+        # Build strides - 找到真正的 Detect 头
+        detect_module = None
+        for m in self.model:
+            if type(m).__name__ == 'Detect':
+                detect_module = m
+                break
+
+        if detect_module is not None:
+            m = detect_module
+            s = 256  # 2x min stride
+            m.inplace = self.inplace
+            forward = lambda x: self.forward(x)[0] if isinstance(m, (Segment, Pose, OBB)) else self.forward(x)
+            m.stride = torch.tensor([s / x.shape[-2] for x in forward(torch.zeros(1, ch, s, s))])  # forward
+            self.stride = m.stride
+            m.bias_init()  # 初始化 Detect 头的偏置
+        else:
+            self.stride = torch.Tensor([32])  # default stride
+
+        # Init weights, biases
+        initialize_weights(self)
+        if verbose:
+            self.info()
+            LOGGER.info('')
+
+        # 测完步长后，立刻把残留的计算图销毁，防止 EMA 拷贝崩溃！
+        self._shift_out = None
+
+    def _initialize_biases(self, cf=None):
+        """重写偏置初始化，精准狙击 Detect 头，防止 cls_loss 爆炸"""
+        import math
+
+        # 1. 全网搜捕真正的 Detect 头
+        detect_module = None
+        for m in self.model:
+            if type(m).__name__ == 'Detect':
+                detect_module = m
+                break
+
+        if detect_module is None:
+            return
+
+        m = detect_module
+
+        # 2. 注入 YOLO 官方的灵魂校准公式
+        for a, b, s in zip(m.cv2, m.cv3, m.stride):  # from
+            a[-1].bias.data[:] = 1.0  # box
+            b[-1].bias.data[:m.nc] = math.log(5 / m.nc / (640 / s) ** 2)  # cls (.01 obj, 80 classes, 640 img)
+
+    def _predict_once(self, x, profile=False, visualize=False, embed=None):
+        """前向传播，把 shift_out 藏在身上，伪装成正常检测模型"""
+        y, dt = [], []
+        detect_out, shift_out = None, None
+
+        for m in self.model:
+            if m.f != -1:
+                x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]
+            if profile:
+                self._profile_one_layer(m, x, dt)
+
+            x = m(x)
+            y.append(x if m.i in self.save else None)
+
+            if type(m).__name__ == 'Detect':
+                detect_out = x
+            elif type(m).__name__ == 'ShiftHead':
+                shift_out = x
+
+        # 核心破局：把 shift_out 藏在自己肚子里！
+        self._shift_out = shift_out
+
+        # 表面上只返回 detect_out，完美骗过 YOLO 所有的底层检测和初始化！
+        return detect_out
+
+    def loss(self, batch, preds=None):
+        """拦截 batch，注入 modality，提取隐藏的 shift_out 并计算总 Loss"""
+        if not hasattr(self, 'criterion'):
+            self.criterion = self.init_criterion()
+
+        # 1. 从 batch 中提取 shift_modality，注入给 ShiftHead
+        shift_modality = batch.get('shift_modality', None)
+        for m in self.model:
+            if type(m).__name__ == 'ShiftHead':
+                m.shift_modality = shift_modality
+
+        # 2. 执行前向传播 (这会触发上面的 _predict_once，生成并隐藏 _shift_out)
+        preds = self.forward(batch['img']) if preds is None else preds
+
+        # 3. 从肚子里掏出刚才藏好的 shift_out
+        shift_preds = getattr(self, '_shift_out', None)
+
+        # 用完立马焚毁！防止 Epoch 结束保存模型 checkpoint 时再次引发深拷贝崩溃！
+        self._shift_out = None
+
+        # 4. 把两者打包成元组，正式交给自定义 Loss 函数！
+        return self.criterion((preds, shift_preds), batch)
+
     def init_criterion(self):
         """Initialize the loss criterion for ShiftDetectionModel."""
         return v8ShiftDetectionLoss(self)
@@ -812,6 +918,9 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             args.append([ch[x] for x in f])
             if m is Segment:
                 args[2] = make_divisible(min(args[2], max_channels) * width, 8)
+        elif m is ShiftHead:
+            args.insert(0, [ch[x] for x in f])  # 把这6个输入的通道数打包传给 ShiftHead
+            c2 = 2  # 假装输出通道是2，防止报错（因为后面没层了，是多少无所谓）
         elif m is RTDETRDecoder:  # special case, channels arg must be passed in index 1
             args.insert(1, [ch[x] for x in f])
         else:
@@ -939,3 +1048,53 @@ def guess_model_task(model):
     LOGGER.warning("WARNING ⚠️ Unable to automatically guess model task, assuming 'task=detect'. "
                    "Explicitly define task for your model, i.e. 'task=detect', 'segment', 'classify','pose' or 'obb'.")
     return 'detect'  # assume detect
+
+
+class ShiftDetectionModelV2(DetectionModel):
+    """
+    Shift Detection Model V2
+    - 检测分支: 使用融合特征 (Add 后)
+    - Shift 分支: 使用独立的 RGB/IR 特征，通过交叉注意力预测偏移
+    """
+    
+    def __init__(self, cfg='yolov8_shift_v2.yaml', ch=6, nc=None, verbose=True):
+        """Initialize YOLOv8 Shift Detection Model V2."""
+        super().__init__(cfg=cfg, ch=ch, nc=nc, verbose=verbose)
+    
+    def forward(self, x, shift_modality=None):
+        """
+        前向传播
+        
+        Args:
+            x: 输入图像 [B, 6, H, W]
+            shift_modality: 哪个模态被平移了 ('rgb' 或 'ir') 或 [B] tensor
+                           由 batch 传入，用于确定注意力的 query/kv 方向
+        
+        Returns:
+            训练时: (detect_output, shift_output)
+            推理时: detect_output
+        """
+        # 调用父类前向传播
+        y = super().forward(x)
+        
+        if self.training:
+            # 模型输出是元组形式：(detect_output, shift_output)
+            # detect_output: [detect_feat_p3, detect_feat_p4, detect_feat_p5]
+            # shift_output: [shift_p3, shift_p4, shift_p5]
+            if isinstance(y, tuple) and len(y) == 2:
+                return y
+            else:
+                # 如果不是元组，说明可能没有正确处理
+                # 需要从 model 输出中分离
+                if isinstance(y, list) and len(y) > 1:
+                    # 假设最后一个元素是 shift_output
+                    detect_output = y[:-1]
+                    shift_output = y[-1]
+                    return detect_output, shift_output
+                else:
+                    return y, None
+        return y
+    
+    def init_criterion(self):
+        """初始化损失函数"""
+        return v8ShiftDetectionLossV2(self)

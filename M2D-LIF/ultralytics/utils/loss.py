@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ultralytics.nn.modules import Detect, ShiftDetect, ShiftHead
 from ultralytics.utils.metrics import OKS_SIGMA
 from ultralytics.utils.ops import crop_mask, xywh2xyxy, xyxy2xywh
 from ultralytics.utils.tal import RotatedTaskAlignedAssigner, TaskAlignedAssigner, dist2bbox, dist2rbox, make_anchors, \
@@ -271,80 +272,122 @@ class v8DetectionLoss:
 class v8ShiftDetectionLoss(v8DetectionLoss):
     """
     Detection loss with object-level shift prediction.
-    
+
     损失包含：
     - box loss: 边界框回归损失
-    - cls loss: 分类损失  
+    - cls loss: 分类损失
     - dfl loss: 分布焦点损失
     - shift loss: 物体平移预测损失
-    
+
     用于强制模型进行跨模态交互
     """
-    
+
     def __init__(self, model):
         """
         初始化 ShiftDetectionLoss
-        
+
         Args:
             model: 模型实例
         """
-        super().__init__(model)
+        import torch
+
+        # 手动初始化，访问 Detect 模块（倒数第二个模块，索引 -2）
+        device = next(model.parameters()).device
+        h = model.args
+
+        # 找到 Detect 模块（通常是倒数第二个，最后一个可能是 ShiftHead）
+        m = None
+        for module in reversed(model.model):
+            if isinstance(module, (Detect, ShiftDetect)):
+                m = module
+                break
+
+        if m is None:
+            raise ValueError("Cannot find Detect module in the model")
+
+        self.bce = nn.BCEWithLogitsLoss(reduction='none')
+        self.hyp = h
+        self.stride = m.stride  # model strides
+        self.nc = m.nc  # number of classes
+        self.no = m.no
+        self.reg_max = m.reg_max
+        self.device = device
+        self.use_dfl = m.reg_max > 1
+
+        self.assigner = TaskAlignedAssigner(topk=10, num_classes=self.nc, alpha=0.5, beta=6.0)
+        self.bbox_loss = BboxLoss(m.reg_max - 1, use_dfl=self.use_dfl).to(device)
+        self.proj = torch.arange(m.reg_max, dtype=torch.float, device=device)
+
         # 从模型参数获取 shift loss 权重
         self.shift_weight = getattr(model.args, 'shift_weight', 1.0)
+        self.shift_mask_weight = getattr(model.args, 'shift_mask_weight', 0.5)
     
     def __call__(self, preds, batch):
         """
         计算总损失
-        
+
         Args:
-            preds: 模型预测输出
+            preds: 模型预测输出 (detect_out, shift_out) 或 detect_out
             batch: 批次数据
-        
+
         Returns:
             total_loss: 总损失
             loss_items: 各项损失 [box, cls, dfl, shift]
         """
         # 损失数组: [box, cls, dfl, shift]
         loss = torch.zeros(4, device=self.device)
-        
-        # 获取特征图
-        feats = preds[1] if isinstance(preds, tuple) else preds
+
+        # 获取特征图和 shift 输出
+        if isinstance(preds, tuple) and len(preds) == 2:
+            # 训练模式: (detect_out, shift_out)
+            feats, shift_out = preds[0], preds[1]
+        else:
+            # 推理模式或单输出: 只有 detect_out
+            feats = preds
+            shift_out = None
+
+        # 专门防范验证阶段的元组打包！把推理用的预测结果剥离掉，只拿训练特征图
+        # 验证时 Detect 头返回 (预测结果, 三层特征图)，需要取第二个元素
+        if isinstance(feats, tuple):
+            feats = feats[1]
+
         batch_size = feats[0].shape[0]
-        
-        # 分离预测: box, cls, shift
-        # 训练时: feats[i] 的形状是 [B, no_train, H, W]，其中 no_train = nc + reg_max*4 + 2
-        # 推理/验证时: feats[i] 的形状是 [B, no_train, H, W]，但只有前 no_infer 个通道有效
-        
-        # 直接分离，避免维度错误
+
+        # 分离预测: box, cls（从 Detect 头获取），shift（从 ShiftHead 获取）
+        # feats[i] 的形状是 [B, nc + reg_max*4, H, W]，只包含 box + cls
+        # shift_out[i] 的形状是 [B, 2, H, W]，包含 shift 预测
+
+        # 直接分离 Detect 头的输出
         pred_dist_list = []
         pred_scores_list = []
-        pred_shift_list = []
-        
+
         for xi in feats:
-            # xi: [B, no, H, W]
-            no = xi.shape[1]  # 总通道数
-            if no == self.nc + self.reg_max * 4 + 2:
-                # 训练模式：有 shift 信息
-                pred_dist_i, pred_scores_i, pred_shift_i = xi.split(
-                    (self.reg_max * 4, self.nc, 2), 1
-                )
-                pred_shift_list.append(pred_shift_i)
-            else:
-                # 推理/验证模式：只有 box + cls
-                pred_dist_i, pred_scores_i = xi.split(
-                    (self.reg_max * 4, self.nc), 1
-                )
+            # xi: [B, no, H, W]，其中 no = nc + reg_max*4
+            pred_dist_i, pred_scores_i = xi.split(
+                (self.reg_max * 4, self.nc), 1
+            )
             pred_dist_list.append(pred_dist_i)
             pred_scores_list.append(pred_scores_i)
-        
-        # 拼接所有尺度
+
+        # 拼接所有尺度的检测输出
         pred_distri = torch.cat([pi.view(batch_size, self.reg_max * 4, -1) for pi in pred_dist_list], 2)
         pred_scores = torch.cat([pi.view(batch_size, self.nc, -1) for pi in pred_scores_list], 2)
-        pred_shift = torch.cat([pi.view(batch_size, 2, -1) for pi in pred_shift_list], 2) if pred_shift_list else None
+
+        # 从 ShiftHead 获取 shift 预测
+        if shift_out is not None:
+            # shift_out 是一个列表，包含三个尺度的 shift 预测
+            pred_shift_list = []
+            for si in shift_out:
+                # si: [B, 2, H, W]
+                pred_shift_list.append(si.view(batch_size, 2, -1))
+            pred_shift = torch.cat(pred_shift_list, 2)  # [B, 2, N_anchors]
+        else:
+            pred_shift = None
         
         pred_scores = pred_scores.permute(0, 2, 1).contiguous()  # [B, N_anchors, nc]
         pred_distri = pred_distri.permute(0, 2, 1).contiguous()  # [B, N_anchors, reg_max*4]
         if pred_shift is not None:
+            # pred_shift 当前是 [B, 2, N_anchors]，需要转置为 [B, N_anchors, 2]
             pred_shift = pred_shift.permute(0, 2, 1).contiguous()  # [B, N_anchors, 2]
         
         dtype = pred_scores.dtype
@@ -418,18 +461,23 @@ class v8ShiftDetectionLoss(v8DetectionLoss):
                 return loss
             
             # 计算 shift loss
-            # 只对真正被平移的物体计算损失（shift_mask=1）
+            # 所有正样本都有监督：
+            # - shift_mask=0 的物体：shift_gt=[0, 0]，监督模型预测 0
+            # - shift_mask=1 的物体：shift_gt=[dx, dy]，监督模型预测真实偏移
+            # 可以用 shift_mask 作为权重，让真正平移的物体有更大的 loss 权重
             if shift_mask is not None:
                 shift_mask_fg = shift_mask[gt_idx_for_fg]  # [N_fg_valid]
-                valid_shift = shift_mask_fg > 0.5
+                # 所有样本都计算 loss，但被平移的物体（shift_mask=1）权重更高
+                # shift_mask=0: 权重 shift_mask_weight，监督预测 [0, 0]
+                # shift_mask=1: 权重 1.0，监督预测 [dx, dy]
+                weights = torch.where(shift_mask_fg > 0.5, 
+                                      torch.ones_like(shift_mask_fg), 
+                                      torch.full_like(shift_mask_fg, self.shift_mask_weight))
                 
-                if valid_shift.sum() > 0:
-                    shift_loss = F.smooth_l1_loss(
-                        pred_shift_fg[valid_shift],
-                        shift_gt_fg[valid_shift],
-                        reduction='mean'
-                    )
-                    loss[3] = shift_loss * self.shift_weight
+                # 加权 smooth L1 loss
+                elementwise_loss = F.smooth_l1_loss(pred_shift_fg, shift_gt_fg, reduction='none')  # [N_fg_valid, 2]
+                weighted_loss = (elementwise_loss * weights.unsqueeze(1)).mean()
+                loss[3] = weighted_loss * self.shift_weight * 100  # 乘以 100 增大量级，方便调参
             else:
                 # 如果没有 shift_mask，对所有正样本计算
                 shift_loss = F.smooth_l1_loss(pred_shift_fg, shift_gt_fg, reduction='mean')
@@ -887,3 +935,182 @@ class v8OBBLoss(v8DetectionLoss):
             b, a, c = pred_dist.shape  # batch, anchors, channels
             pred_dist = pred_dist.view(b, a, 4, c // 4).softmax(3).matmul(self.proj.type(pred_dist.dtype))
         return torch.cat((dist2rbox(pred_dist, pred_angle, anchor_points), pred_angle), dim=-1)
+
+
+class v8ShiftDetectionLossV2(v8DetectionLoss):
+    """
+    V2 版本 Shift Detection Loss
+    - 检测 loss: 和原来一样，使用融合特征
+    - Shift loss: 使用独立的 RGB/IR 特征，通过交叉注意力后的输出计算
+    - 使用检测分支的 Assigner 结果保证一致性
+    """
+    
+    def __init__(self, model):
+        """
+        初始化 V2 版本 Shift Detection Loss
+        
+        Args:
+            model: 模型实例
+        """
+        super().__init__(model)
+        self.shift_weight = getattr(model.args, 'shift_weight', 1.0)
+    
+    def __call__(self, preds, batch):
+        """
+        计算总损失
+        
+        Args:
+            preds: (detect_output, shift_output)
+            batch: 包含 shift_gt, shift_mask, shift_modality
+        
+        Returns:
+            total_loss, loss_items [box, cls, dfl, shift]
+        """
+        detect_output, shift_output = preds if isinstance(preds, tuple) else (preds, None)
+        
+        # 损失数组: [box, cls, dfl, shift]
+        loss = torch.zeros(4, device=detect_output[0].device)
+        
+        # ========== 检测 loss (和原来一样) ==========
+        # 获取特征图
+        feats = detect_output
+        batch_size = feats[0].shape[0]
+        
+        # 分离预测: box, cls
+        pred_dist_list = []
+        pred_scores_list = []
+        
+        for xi in feats:
+            no = xi.shape[1]  # 总通道数
+            # V2 模型中，检测分支不包含 shift，只有 box + cls
+            pred_dist_i, pred_scores_i = xi.split(
+                (self.reg_max * 4, self.nc), 1
+            )
+            pred_dist_list.append(pred_dist_i)
+            pred_scores_list.append(pred_scores_i)
+        
+        # 拼接所有尺度
+        pred_distri = torch.cat([pi.view(batch_size, self.reg_max * 4, -1) for pi in pred_dist_list], 2)
+        pred_scores = torch.cat([pi.view(batch_size, self.nc, -1) for pi in pred_scores_list], 2)
+        
+        pred_scores = pred_scores.permute(0, 2, 1).contiguous()
+        pred_distri = pred_distri.permute(0, 2, 1).contiguous()
+        
+        dtype = pred_scores.dtype
+        imgsz = torch.tensor(feats[0].shape[2:], device=self.device, dtype=dtype) * self.stride[0]
+        anchor_points, stride_tensor = make_anchors(feats, self.stride, 0.5)
+        
+        # 处理目标
+        targets = torch.cat((batch['batch_idx'].view(-1, 1), batch['cls'].view(-1, 1), batch['bboxes']), 1)
+        targets = self.preprocess(targets.to(self.device), batch_size, scale_tensor=imgsz[[1, 0, 1, 0]])
+        gt_labels, gt_bboxes = targets.split((1, 4), 2)
+        mask_gt = gt_bboxes.sum(2, keepdim=True).gt_(0)
+        
+        # 解码边界框
+        pred_bboxes = self.bbox_decode(anchor_points, pred_distri)
+        
+        # 分配器
+        _, target_bboxes, target_scores, fg_mask, target_gt_idx = self.assigner(
+            pred_scores.detach().sigmoid(), 
+            (pred_bboxes.detach() * stride_tensor).type(gt_bboxes.dtype),
+            anchor_points * stride_tensor, 
+            gt_labels, gt_bboxes, mask_gt
+        )
+        
+        target_scores_sum = max(target_scores.sum(), 1)
+        
+        # 分类损失
+        loss[1] = self.bce(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum
+        
+        # 边界框损失
+        if fg_mask.sum():
+            target_bboxes /= stride_tensor
+            loss[0], loss[2] = self.bbox_loss(
+                pred_distri, pred_bboxes, anchor_points, 
+                target_bboxes, target_scores, target_scores_sum, fg_mask
+            )
+        
+        # ========== Shift loss ==========
+        if shift_output is not None and 'shift_gt' in batch:
+            shift_loss = self._compute_shift_loss(shift_output, batch, fg_mask, target_gt_idx, batch_size)
+            loss[3] = shift_loss * self.shift_weight
+        
+        # 应用权重
+        loss[0] *= self.hyp.box
+        loss[1] *= self.hyp.cls
+        loss[2] *= self.hyp.dfl
+        # shift loss 已经乘过 shift_weight
+        
+        return loss.sum() * batch_size, loss.detach()
+    
+    def _compute_shift_loss(self, shift_output, batch, fg_mask, target_gt_idx, batch_size):
+        """
+        计算 Shift loss
+        
+        Args:
+            shift_output: [shift_p3, shift_p4, shift_p5]
+                         每个 [B, 2, H, W]
+            batch: 包含 shift_gt, shift_mask
+            fg_mask: [B, N_anchors] - 来自检测分支
+            target_gt_idx: [B, N_anchors] - 来自检测分支
+            batch_size: batch size
+        """
+        # 将三个尺度的 shift 预测拼接
+        shift_preds = []
+        for shift_i in shift_output:
+            B, _, H, W = shift_i.shape
+            shift_preds.append(shift_i.view(B, 2, -1))
+        shift_pred = torch.cat(shift_preds, dim=2)  # [B, 2, N_total]
+        shift_pred = shift_pred.permute(0, 2, 1)    # [B, N_total, 2]
+        
+        # 获取 shift GT
+        shift_gt = batch['shift_gt'].to(self.device)
+        shift_mask = batch.get('shift_mask', None)
+        if shift_mask is not None:
+            shift_mask = shift_mask.to(self.device)
+        
+        # 获取正样本对应的 GT 索引
+        gt_idx_for_fg = target_gt_idx[fg_mask]  # [N_fg]
+        
+        # 确保索引在有效范围内
+        valid_gt_idx = gt_idx_for_fg < len(shift_gt)
+        gt_idx_for_fg = gt_idx_for_fg[valid_gt_idx]
+        fg_mask_valid = torch.zeros_like(fg_mask, dtype=torch.bool)
+        fg_mask_valid[fg_mask] = valid_gt_idx
+        
+        if len(gt_idx_for_fg) == 0:
+            return torch.tensor(0.0, device=self.device)
+        
+        # 获取预测的 shift（仅对有效的正样本）
+        pred_shift_fg = shift_pred[fg_mask_valid]  # [N_fg_valid, 2]
+        
+        # 获取对应的 shift GT
+        shift_gt_fg = shift_gt[gt_idx_for_fg]  # [N_fg_valid, 2]
+        
+        # 检查 shape 是否匹配
+        if pred_shift_fg.shape[0] != shift_gt_fg.shape[0]:
+            return torch.tensor(0.0, device=self.device)
+        
+        # 计算 shift loss
+        # 对所有物体计算，但根据 shift_mask 给不同权重
+        if shift_mask is not None:
+            shift_mask_fg = shift_mask[gt_idx_for_fg]  # [N_fg_valid]
+            
+            # shift_mask=1 (被平移的物体) 权重 1.0
+            # shift_mask=0 (未平移的物体) 权重 0.5
+            weights = torch.where(shift_mask_fg > 0.5, 
+                                 torch.ones_like(shift_mask_fg), 
+                                 torch.full_like(shift_mask_fg, 0.5))
+            
+            # 计算加权 loss
+            if len(weights) > 0:
+                per_sample_loss = F.smooth_l1_loss(pred_shift_fg, shift_gt_fg, reduction='none')
+                per_sample_loss = per_sample_loss.mean(dim=1)  # [N_fg_valid]
+                shift_loss = (per_sample_loss * weights).sum() / weights.sum()
+            else:
+                shift_loss = torch.tensor(0.0, device=self.device)
+        else:
+            # 如果没有 shift_mask，对所有正样本计算
+            shift_loss = F.smooth_l1_loss(pred_shift_fg, shift_gt_fg, reduction='mean')
+        
+        return shift_loss

@@ -2304,6 +2304,7 @@ class ObjectShift(BaseTransform):
         n_obj = len(bboxes) if bboxes is not None else 0
         labels['shift_gt'] = np.zeros((n_obj, 2), dtype=np.float32)
         labels['shift_mask'] = np.zeros(n_obj, dtype=np.float32)
+        labels['shift_modality'] = 0  # 默认 0=RGB 被平移，1=IR 被平移
         
         # 根据概率决定是否应用增强
         if np.random.random() > self.prob or n_obj == 0:
@@ -2315,6 +2316,8 @@ class ObjectShift(BaseTransform):
         
         # 随机选择平移哪个模态 (RGB 或 IR)
         shift_modality = np.random.choice(['rgb', 'ir'])
+        # 记录到 labels: 0=RGB 被平移, 1=IR 被平移
+        labels['shift_modality'] = 0 if shift_modality == 'rgb' else 1
         
         # 分离模态 (假设 img 是 [H, W, 6]，前3通道是RGB，后3通道是IR)
         if img.shape[2] >= 6:

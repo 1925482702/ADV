@@ -54,7 +54,7 @@ class ShiftDetectionTrainer(DetectionTrainer):
         from ultralytics.models import yolo
         from types import SimpleNamespace
         
-        custom_args = ['shift_weight', 'shift_ratio', 'max_shift']
+        custom_args = ['shift_weight', 'shift_ratio', 'shift_mask_weight', 'max_shift']
         validator_args_dict = {k: v for k, v in vars(self.args).items() if k not in custom_args}
         validator_args = SimpleNamespace(**validator_args_dict)
         
@@ -97,6 +97,10 @@ def parse_args():
                         help='Image size')
     parser.add_argument('--shift_weight', type=float, default=1.0,
                         help='Weight for shift loss (λ)')
+    parser.add_argument('--shift_ratio', type=float, default=0.7,
+                        help='Ratio of objects to shift (0.0-1.0)')
+    parser.add_argument('--shift_mask_weight', type=float, default=0.5,
+                        help='Weight for unshifted samples (mask=0)')
     parser.add_argument('--data', type=str, default='./data/FLIR.yaml',
                         help='Path to data config file')
     parser.add_argument('--project', type=str, default='./runs/shift_global',
@@ -107,6 +111,8 @@ def parse_args():
                         help='Initial learning rate')
     parser.add_argument('--workers', type=int, default=8,
                         help='Number of dataloader workers')
+    parser.add_argument('--model', type=str, default='./model_yaml/yolov8_shift_v2.yaml',
+                        help='Path to model config file')
     return parser.parse_args()
 
 
@@ -114,7 +120,7 @@ def main():
     args = parse_args()
     
     # 模型配置文件路径
-    model_yaml = f"./model_yaml/yolov8_shift_global.yaml"
+    model_yaml = args.model
     
     if not os.path.exists(model_yaml):
         LOGGER.error(f"❌ 模型配置文件不存在: {model_yaml}")
@@ -143,6 +149,8 @@ def main():
         'name': f'yolov8{args.scale}_shift_global',
         'lr0': args.lr,
         'shift_weight': args.shift_weight,
+        'shift_ratio': args.shift_ratio,
+        'shift_mask_weight': args.shift_mask_weight,
         'patience': 50,
         'save_period': 10,
         'close_mosaic': 10,
