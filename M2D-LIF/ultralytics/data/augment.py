@@ -16,6 +16,7 @@ from ultralytics.utils.instance import Instances
 from ultralytics.utils.metrics import bbox_ioa
 from ultralytics.utils.ops import segment2box, xyxyxyxy2xywhr
 from ultralytics.utils.torch_utils import TORCHVISION_0_10, TORCHVISION_0_11, TORCHVISION_0_13
+from ultralytics.utils.shift_params import shift_param_manager
 
 from .utils import polygons2masks, polygons2masks_overlap
 
@@ -2304,17 +2305,23 @@ class ObjectShift(BaseTransform):
         n_obj = len(bboxes) if bboxes is not None else 0
         labels['shift_gt'] = np.zeros((n_obj, 2), dtype=np.float32)
         labels['shift_mask'] = np.zeros(n_obj, dtype=np.float32)
+        labels['shift_modality'] = 0  # 默认 0=RGB 被平移，1=IR 被平移
         
         # 根据概率决定是否应用增强
         if np.random.random() > self.prob or n_obj == 0:
             return
-        
-        # 随机选择部分物体
-        n_shift = max(1, int(n_obj * self.shift_ratio))
+
+        # 🔥 关键：从共享内存获取当前 shift_ratio（跨进程安全）
+        current_ratio = shift_param_manager.get_ratio()
+
+        # 随机选择部分物体（使用动态比例）
+        n_shift = max(1, int(n_obj * current_ratio))
         shift_indices = np.random.choice(n_obj, size=min(n_shift, n_obj), replace=False).tolist()
         
         # 随机选择平移哪个模态 (RGB 或 IR)
         shift_modality = np.random.choice(['rgb', 'ir'])
+        # 记录到 labels: 0=RGB 被平移, 1=IR 被平移
+        labels['shift_modality'] = 0 if shift_modality == 'rgb' else 1
         
         # 分离模态 (假设 img 是 [H, W, 6]，前3通道是RGB，后3通道是IR)
         if img.shape[2] >= 6:

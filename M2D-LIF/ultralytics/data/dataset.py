@@ -204,6 +204,9 @@ class YOLODataset(BaseDataset):
                 value = torch.stack(value, 0)
             if k in ['masks', 'keypoints', 'bboxes', 'cls', 'segments', 'obb', 'shift_gt', 'shift_mask']:
                 value = torch.cat(value, 0)
+            if k == 'shift_modality':
+                # shift_modality 需要堆叠成 [B] tensor
+                value = torch.tensor(value, dtype=torch.long)
             new_batch[k] = value
         new_batch['batch_idx'] = list(new_batch['batch_idx'])
         for i in range(len(new_batch['batch_idx'])):

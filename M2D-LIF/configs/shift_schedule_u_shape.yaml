@@ -1,0 +1,60 @@
+# U型训练策略 - 精心设计的训练曲线
+# 目标：在保证检测精度的同时，最大化跨模态对齐能力
+
+schedule_type: u_shape
+description: "U型训练策略：预热→强化→主力→退潮→收敛"
+
+# 全局参数
+total_epochs: 120
+
+# 训练阶段
+stages:
+  # ========== 阶段 1: 热身期 (0-15 Epochs) ==========
+  # 目标：建立稳定的检测基础，学习基本的特征提取
+  - name: "warmup"
+    start_epoch: 0
+    end_epoch: 15
+    shift_ratio: 0.3
+    shift_weight: 0.5
+    shift_mask_weight: 0.2
+    description: "预热阶段：30%平移，建立检测基础"
+
+  # ========== 阶段 2: 强化期 (16-30 Epochs) ==========
+  # 目标：引入对齐任务，模型开始学习跨模态对应关系
+  - name: "intensify"
+    start_epoch: 16
+    end_epoch: 30
+    shift_ratio: 0.5
+    shift_weight: 1.0
+    shift_mask_weight: 0.2
+    description: "强化阶段：50%平移，引入对齐任务"
+
+  # ========== 阶段 3: 主力期 (31-90 Epochs) ==========
+  # 目标：极限抗压训练，60轮强化跨模态对齐
+  - name: "main_battle"
+    start_epoch: 31
+    end_epoch: 90
+    shift_ratio: 0.7
+    shift_weight: 1.0
+    shift_mask_weight: 0.2
+    description: "主力阶段：70%平移，极限抗压训练（60轮）"
+
+  # ========== 阶段 4: 退潮期 (91-105 Epochs) ==========
+  # 目标：逐步减少对齐干扰，让模型收敛
+  - name: "fade_out"
+    start_epoch: 91
+    end_epoch: 105
+    shift_ratio: 0.3
+    shift_weight: 0.8
+    shift_mask_weight: 0.2
+    description: "退潮阶段：30%平移，逐步减少对齐干扰"
+
+  # ========== 阶段 5: 收敛期 (106-120 Epochs) ==========
+  # 目标：完全关闭平移，纯净数据微调检测精度
+  - name: "converge"
+    start_epoch: 106
+    end_epoch: 120
+    shift_ratio: 0.0
+    shift_weight: 0.5
+    shift_mask_weight: 0.2
+    description: "收敛阶段：0%平移，纯净数据微调"

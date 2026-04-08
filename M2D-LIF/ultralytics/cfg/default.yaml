@@ -128,5 +128,6 @@ distill_type : False
 # Shift Detection Module Parameters ------------------------------------------------------------------------------------
 shift_weight: 1.0  # (float) shift loss 的权重 λ
 shift_ratio: 0.3  # (float) 被平移物体的比例 (渐进式训练中动态调整)
+shift_mask_weight: 0.2  # (float) 未平移样本（mask=0）的权重
 max_shift_px: 40  # (int) 最大平移量（绝对像素），范围 [8, 40]
 min_shift_px: 8   # (int) 最小平移量（绝对像素）
