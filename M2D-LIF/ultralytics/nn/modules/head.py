@@ -547,7 +547,7 @@ class CrossModalShift(nn.Module):
         - shift_pred: 每个位置的偏移预测 [B, 2, H, W]
     """
     
-    def __init__(self, channels, num_heads=4, downsample=True):
+    def __init__(self, channels, num_heads=4, downsample=False):
         super().__init__()
         self.num_heads = num_heads
         self.downsample = downsample
