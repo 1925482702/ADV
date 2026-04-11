@@ -23,7 +23,7 @@ if __name__ == '__main__':
         rect=False
     )
 
-    DEFAULT_CFG.save_dir = f""
+    DEFAULT_CFG.save_dir = f"./runs/FLIR_IR_SHIFT"
 
     model_s = DetectionTrainer(overrides=args)
     model_s.train()

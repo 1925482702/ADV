@@ -60,6 +60,7 @@ class BaseTransform:
         self.apply_image(labels)
         self.apply_instances(labels)
         self.apply_semantic(labels)
+        return labels  # 必须返回 labels，否则 Compose 会收到 None
 
 
 class Compose:
@@ -1018,6 +1019,306 @@ class Albumentations:
         return labels
 
 
+class SingleModalObjectShift(BaseTransform):
+    """
+    单模态物体平移增强（放大+复制粘贴，无空洞）
+    
+    与双模态的区别：
+    - 只处理 3 通道图像
+    - 平移后更新 bbox 坐标（而不是保持不变）
+    - 不需要 shift_gt/shift_mask
+    
+    目的：让单模态模型学习"平移"图像的特征提取能力
+    """
+    
+    def __init__(self, max_shift_px=40, shift_ratio=0.3, prob=0.5, min_shift_px=8):
+        """
+        初始化单模态物体平移增强
+        
+        Args:
+            max_shift_px: 最大平移量（像素）
+            shift_ratio: 被平移物体的比例
+            prob: 应用增强的概率
+            min_shift_px: 最小平移量（像素）
+        """
+        super().__init__()
+        self.max_shift_px = max_shift_px
+        self.shift_ratio = shift_ratio
+        self.prob = prob
+        self.min_shift_px = min_shift_px
+    
+    def apply_image(self, labels):
+        """对图像应用物体平移，并更新 bbox"""
+        img = labels.get('img')
+        if img is None:
+            return
+        
+        h, w = img.shape[:2]
+        
+        # 获取 instances
+        instances = labels.get('instances')
+        if instances is None:
+            return
+        
+        bboxes = instances.bboxes  # [N, 4] xywh 归一化坐标
+        if isinstance(bboxes, torch.Tensor):
+            bboxes = bboxes.cpu().numpy()
+        
+        n_obj = len(bboxes)
+        if n_obj == 0:
+            return
+        
+        # 根据概率决定是否应用
+        if np.random.random() > self.prob:
+            return
+        
+        # 选择部分物体
+        n_shift = max(1, int(n_obj * self.shift_ratio))
+        shift_indices = np.random.choice(n_obj, size=min(n_shift, n_obj), replace=False)
+        
+        # 记录哪些物体被平移了，以及平移量
+        shift_records = []  # [(idx, dx_px, dy_px), ...]
+        
+        # 转换为列表以便修改
+        bboxes_list = bboxes.tolist() if isinstance(bboxes, np.ndarray) else list(bboxes)
+        
+        for idx in shift_indices:
+            bbox = bboxes_list[idx]
+            result = self._shift_single_object(img, bbox, bboxes_list, h, w, idx)
+            if result is not None:
+                dx_px, dy_px = result
+                shift_records.append((idx, dx_px, dy_px))
+        
+        # 更新 bbox（关键区别！bbox 跟着物体移动）
+        for idx, dx_px, dy_px in shift_records:
+            cx, cy, bw, bh = bboxes_list[idx]
+            new_cx = cx + dx_px / w
+            new_cy = cy + dy_px / h
+            bboxes_list[idx] = [new_cx, new_cy, bw, bh]
+        
+        # 更新 instances（使用 _bboxes.bboxes，因为 bboxes 是只读 property）
+        instances._bboxes.bboxes = np.array(bboxes_list, dtype=np.float32)
+    
+    def apply_instances(self, labels):
+        """实例级变换（已在 apply_image 中处理）"""
+        pass
+    
+    def apply_semantic(self, labels):
+        """语义分割变换（暂不处理）"""
+        pass
+    
+    def _get_enlarged_region(self, x1, y1, x2, y2, dx_px, dy_px, w, h):
+        """计算放大后的裁剪区域（用于无空洞平移）"""
+        crop_x1 = max(0, x1 - max(dx_px, 0))   # 向左平移时，向左扩展
+        crop_y1 = max(0, y1 - max(dy_px, 0))   # 向上平移时，向上扩展
+        crop_x2 = min(w, x2 - min(dx_px, 0))   # 向右平移时，向右扩展
+        crop_y2 = min(h, y2 - min(dy_px, 0))   # 向下平移时，向下扩展
+        return crop_x1, crop_y1, crop_x2, crop_y2
+    
+    def _check_overlap(self, x1, y1, x2, y2, bboxes, w, h, exclude_idx=None):
+        """检查区域是否与其他物体重叠"""
+        for i, bbox in enumerate(bboxes):
+            if exclude_idx is not None and i == exclude_idx:
+                continue
+            cx, cy, bw, bh = bbox
+            bx1 = int((cx - bw/2) * w)
+            by1 = int((cy - bh/2) * h)
+            bx2 = int((cx + bw/2) * w)
+            by2 = int((cy + bh/2) * h)
+            
+            # 检查重叠
+            if not (x2 <= bx1 or x1 >= bx2 or y2 <= by1 or y1 >= by2):
+                return True
+        return False
+    
+    def _shift_single_object(self, img, bbox, bboxes, h, w, bbox_idx):
+        """
+        单个物体平移（放大+复制粘贴，无空洞）
+        
+        Args:
+            img: 图像 [H, W, 3]
+            bbox: 当前物体 bbox [cx, cy, bw, bh] 归一化坐标
+            bboxes: 所有物体 bbox 列表
+            h, w: 图像宽高
+            bbox_idx: 当前物体索引
+        
+        Returns:
+            (dx_px, dy_px): 平移量（像素），如果无法平移则返回 None
+        """
+        cx, cy, bw, bh = bbox
+        
+        # 转换为像素坐标
+        cx_px = int(cx * w)
+        cy_px = int(cy * h)
+        bw_px = max(int(bw * w), 1)
+        bh_px = max(int(bh * h), 1)
+        
+        obj_x1 = max(0, cx_px - bw_px // 2)
+        obj_y1 = max(0, cy_px - bh_px // 2)
+        obj_x2 = min(w, cx_px + bw_px // 2)
+        obj_y2 = min(h, cy_px + bh_px // 2)
+        
+        obj_w = obj_x2 - obj_x1
+        obj_h = obj_y2 - obj_y1
+        
+        if obj_w <= 0 or obj_h <= 0:
+            return None
+        
+        # ========== 边缘检测 ==========
+        # 判断物体是否位于图像边缘（边缘阈值 = 最大平移量）
+        edge_threshold = self.max_shift_px
+        at_left_edge = obj_x1 < edge_threshold
+        at_right_edge = obj_x2 > w - edge_threshold
+        at_top_edge = obj_y1 < edge_threshold
+        at_bottom_edge = obj_y2 > h - edge_threshold
+        
+        # 如果物体位于两个方向的边缘（如右下角），跳过该物体
+        if (at_left_edge or at_right_edge) and (at_top_edge or at_bottom_edge):
+            return None
+        
+        # 如果物体位于左右边缘，不进行 X 方向平移
+        skip_x = at_left_edge or at_right_edge
+        # 如果物体位于上下边缘，不进行 Y 方向平移
+        skip_y = at_top_edge or at_bottom_edge
+        
+        # 如果两个方向都跳过，直接返回
+        if skip_x and skip_y:
+            return None
+        
+        # 随机平移量
+        dx_px = np.random.randint(self.min_shift_px, self.max_shift_px + 1)
+        dy_px = np.random.randint(self.min_shift_px, self.max_shift_px + 1)
+        
+        # 随机方向
+        if np.random.random() > 0.5:
+            dx_px = -dx_px
+        if np.random.random() > 0.5:
+            dy_px = -dy_px
+        
+        # ========== 分方向检查 ==========
+        x_ok = False
+        x_dx = 0
+        
+        # 如果位于左右边缘，直接跳过 X 方向
+        if skip_x:
+            x_ok = False
+        else:
+            # X 方向检查
+            for test_dx in [dx_px, -dx_px]:
+                if test_dx == 0:
+                    continue
+        
+        # X 方向检查
+        for test_dx in [dx_px, -dx_px]:
+            if test_dx == 0:
+                continue
+            
+            crop_x1, crop_y1, crop_x2, crop_y2 = self._get_enlarged_region(
+                obj_x1, obj_y1, obj_x2, obj_y2, test_dx, 0, w, h
+            )
+            paste_x1 = crop_x1 + test_dx
+            paste_x2 = crop_x2 + test_dx
+            
+            if paste_x1 < 0 or paste_x2 > w:
+                continue
+            
+            # 检查扩展区域
+            if test_dx > 0:
+                ext_x1, ext_y1, ext_x2, ext_y2 = crop_x1, obj_y1, obj_x1, obj_y2
+            else:
+                ext_x1, ext_y1, ext_x2, ext_y2 = obj_x2, obj_y1, crop_x2, obj_y2
+            
+            if self._check_overlap(ext_x1, ext_y1, ext_x2, ext_y2, bboxes, w, h, bbox_idx):
+                continue
+            
+            # 检查粘贴位置
+            if self._check_overlap(paste_x1, obj_y1, paste_x2, obj_y2, bboxes, w, h, bbox_idx):
+                continue
+            
+            x_ok = True
+            x_dx = test_dx
+            break
+        
+        # Y 方向检查
+        y_ok = False
+        y_dy = 0
+        
+        # 如果位于上下边缘，直接跳过 Y 方向
+        if skip_y:
+            y_ok = False
+        else:
+            for test_dy in [dy_px, -dy_px]:
+                if test_dy == 0:
+                    continue
+                
+                crop_x1, crop_y1, crop_x2, crop_y2 = self._get_enlarged_region(
+                    obj_x1, obj_y1, obj_x2, obj_y2, 0, test_dy, w, h
+                )
+                paste_y1 = crop_y1 + test_dy
+                paste_y2 = crop_y2 + test_dy
+                
+                if paste_y1 < 0 or paste_y2 > h:
+                    continue
+                
+                # 检查扩展区域
+                if test_dy > 0:
+                    ext_x1, ext_y1, ext_x2, ext_y2 = obj_x1, crop_y1, obj_x2, obj_y1
+                else:
+                    ext_x1, ext_y1, ext_x2, ext_y2 = obj_x1, obj_y2, obj_x2, crop_y2
+                
+                if self._check_overlap(ext_x1, ext_y1, ext_x2, ext_y2, bboxes, w, h, bbox_idx):
+                    continue
+                
+                # 检查粘贴位置
+                if self._check_overlap(obj_x1, paste_y1, obj_x2, paste_y2, bboxes, w, h, bbox_idx):
+                    continue
+                
+                y_ok = True
+                y_dy = test_dy
+                break
+        
+        if not x_ok and not y_ok:
+            return None
+        
+        final_dx_px = x_dx if x_ok else 0
+        final_dy_px = y_dy if y_ok else 0
+        
+        # ========== 执行放大+复制粘贴 ==========
+        crop_x1, crop_y1, crop_x2, crop_y2 = self._get_enlarged_region(
+            obj_x1, obj_y1, obj_x2, obj_y2, final_dx_px, final_dy_px, w, h
+        )
+        
+        paste_x1 = crop_x1 + final_dx_px
+        paste_y1 = crop_y1 + final_dy_px
+        paste_x2 = crop_x2 + final_dx_px
+        paste_y2 = crop_y2 + final_dy_px
+        
+        # 边界处理
+        valid_paste_x1 = max(0, paste_x1)
+        valid_paste_y1 = max(0, paste_y1)
+        valid_paste_x2 = min(w, paste_x2)
+        valid_paste_y2 = min(h, paste_y2)
+        
+        valid_w = valid_paste_x2 - valid_paste_x1
+        valid_h = valid_paste_y2 - valid_paste_y1
+        
+        if valid_w <= 0 or valid_h <= 0:
+            return None
+        
+        crop_start_x = valid_paste_x1 - paste_x1
+        crop_start_y = valid_paste_y1 - paste_y1
+        valid_crop_x1 = crop_x1 + crop_start_x
+        valid_crop_y1 = crop_y1 + crop_start_y
+        valid_crop_x2 = valid_crop_x1 + valid_w
+        valid_crop_y2 = valid_crop_y1 + valid_h
+        
+        # 提取并粘贴（无空洞）
+        enlarged_region = img[valid_crop_y1:valid_crop_y2, valid_crop_x1:valid_crop_x2].copy()
+        img[valid_paste_y1:valid_paste_y2, valid_paste_x1:valid_paste_x2] = enlarged_region
+        
+        return final_dx_px, final_dy_px
+
+
 # TODO: technically this is not an augmentation, maybe we should put this to another files
 class Format:
     """
@@ -1222,16 +1523,31 @@ def v8_transforms(dataset, imgsz, hyp, stretch=False):
         elif flip_idx and (len(flip_idx) != kpt_shape[0]):
             raise ValueError(f"data.yaml flip_idx={flip_idx} length must be equal to kpt_shape[0]={kpt_shape[0]}")
 
-    return Compose(
-        [
-            pre_transform,
-            MixUp(dataset, pre_transform=pre_transform, p=hyp.mixup),
-            Albumentations(p=1.0),
-            RandomHSV(hgain=hyp.hsv_h, sgain=hyp.hsv_s, vgain=hyp.hsv_v),
-            RandomFlip(direction="vertical", p=hyp.flipud),
-            RandomFlip(direction="horizontal", p=hyp.fliplr, flip_idx=flip_idx),
-        ]
-    )  # transforms
+    # Object Shift 增强（单模态物体平移）
+    object_shift = getattr(hyp, 'object_shift', 0.0)
+    object_shift_transform = None
+    if object_shift > 0:
+        object_shift_transform = SingleModalObjectShift(
+            max_shift_px=getattr(hyp, 'max_shift_px', 40),
+            min_shift_px=getattr(hyp, 'min_shift_px', 8),
+            shift_ratio=getattr(hyp, 'shift_ratio', 0.3),
+            prob=object_shift
+        )
+    
+    transforms_list = [
+        pre_transform,
+        MixUp(dataset, pre_transform=pre_transform, p=hyp.mixup),
+        Albumentations(p=1.0),
+        RandomHSV(hgain=hyp.hsv_h, sgain=hyp.hsv_s, vgain=hyp.hsv_v),
+        RandomFlip(direction="vertical", p=hyp.flipud),
+        RandomFlip(direction="horizontal", p=hyp.fliplr, flip_idx=flip_idx),
+    ]
+    
+    # 添加 Object Shift（在 RandomFlip 之后）
+    if object_shift_transform is not None:
+        transforms_list.append(object_shift_transform)
+    
+    return Compose(transforms_list)  # transforms
 
 
 # Classification augmentations -----------------------------------------------------------------------------------------

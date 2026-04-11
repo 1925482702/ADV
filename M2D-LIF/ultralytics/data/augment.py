@@ -2361,15 +2361,63 @@ class ObjectShift(BaseTransform):
             # 如果图像为空，保持原始图像不变
             pass
     
+    def _check_overlap_with_objects(self, x1, y1, x2, y2, bboxes, w, h, current_bbox=None):
+        """
+        检查指定区域是否与其他物体重叠
+        
+        Args:
+            x1, y1, x2, y2: 要检查的区域像素坐标
+            bboxes: 所有物体的边界框 [N, 4] xywh 归一化坐标
+            w, h: 图像宽高
+            current_bbox: 当前物体的bbox（用于排除自身）
+        
+        Returns:
+            bool: True 表示有重叠，False 表示无重叠
+        """
+        for bbox_i in bboxes:
+            # 跳过自身
+            if current_bbox is not None and np.allclose(bbox_i, current_bbox):
+                continue
+            
+            cx_i, cy_i, bw_i, bh_i = bbox_i
+            bx1 = max(0, int((cx_i - bw_i/2) * w))
+            by1 = max(0, int((cy_i - bh_i/2) * h))
+            bx2 = min(w, int((cx_i + bw_i/2) * w))
+            by2 = min(h, int((cy_i + bh_i/2) * h))
+            
+            # 检查重叠
+            if not (x2 <= bx1 or x1 >= bx2 or y2 <= by1 or y1 >= by2):
+                return True
+        
+        return False
+    
+    def _get_enlarged_region(self, x1, y1, x2, y2, dx_px, dy_px, w, h):
+        """
+        计算放大后的裁剪区域（用于无空洞平移）
+        
+        Args:
+            x1, y1, x2, y2: 原始物体框像素坐标
+            dx_px, dy_px: 平移量（像素）
+            w, h: 图像宽高
+        
+        Returns:
+            crop_x1, crop_y1, crop_x2, crop_y2: 放大后的裁剪区域
+        """
+        crop_x1 = max(0, x1 - max(dx_px, 0))   # 向左平移时，向左扩展
+        crop_y1 = max(0, y1 - max(dy_px, 0))   # 向上平移时，向上扩展
+        crop_x2 = min(w, x2 - min(dx_px, 0))   # 向右平移时，向右扩展
+        crop_y2 = min(h, y2 - min(dy_px, 0))   # 向下平移时，向下扩展
+        return crop_x1, crop_y1, crop_x2, crop_y2
+    
     def _shift_single_object_v2(self, target_img, bbox, bboxes, h, w):
         """
-        物体-背景交换增强
+        物体放大+复制粘贴平移（无空洞，带扩展区域检查）
         
-        步骤：
-        1. 提取物体框区域
-        2. 随机选择新的位置粘贴物体（8-40px绝对平移）
-        3. 从背景中选择相同大小的区域，贴回原物体位置
-        4. 避免选择背景时与任何物体重叠
+        核心逻辑：
+        1. 向左平移时，裁剪框向左扩展（覆盖平移后露出的区域）
+        2. 检查扩展区域是否与其他物体重叠
+        3. 如果某方向有问题，该方向不平移，只保留另一个方向
+        4. 如果两个方向都有问题，跳过该物体
         
         Args:
             target_img: 目标模态图像 [H, W, 3]
@@ -2403,11 +2451,7 @@ class ObjectShift(BaseTransform):
         if obj_w <= 0 or obj_h <= 0:
             return None
         
-        # 提取物体区域
-        object_region = target_img[obj_y1:obj_y2, obj_x1:obj_x2].copy()
-        
-        # 随机平移量（绝对像素范围，不依赖物体尺寸）
-        # 在 [min_shift_px, max_shift_px] 范围内均匀分布
+        # 随机平移量（绝对像素范围）
         dx_px = np.random.randint(self.min_shift_px, self.max_shift_px + 1)
         dy_px = np.random.randint(self.min_shift_px, self.max_shift_px + 1)
         
@@ -2417,66 +2461,144 @@ class ObjectShift(BaseTransform):
         if np.random.random() > 0.5:
             dy_px = -dy_px
         
-        # 计算新的物体位置
-        new_obj_x1 = obj_x1 + dx_px
-        new_obj_y1 = obj_y1 + dy_px
-        new_obj_x2 = new_obj_x1 + obj_w
-        new_obj_y2 = new_obj_y1 + obj_h
+        # ========== 分方向检查 ==========
+        x_ok = False
+        x_dx = 0
         
-        # 边界检查：确保新位置在图像范围内
-        if new_obj_x1 < 0 or new_obj_x2 > w or new_obj_y1 < 0 or new_obj_y2 > h:
-            # 超出边界，尝试反向
-            dx_px = -dx_px
-            dy_px = -dy_px
-            new_obj_x1 = obj_x1 + dx_px
-            new_obj_y1 = obj_y1 + dy_px
-            new_obj_x2 = new_obj_x1 + obj_w
-            new_obj_y2 = new_obj_y1 + obj_h
+        # --- 检查 X 方向（只做 X 平移） ---
+        for test_dx in [dx_px, -dx_px]:
+            if test_dx == 0:
+                continue
+            # 计算放大后的裁剪区域
+            crop_x1, crop_y1, crop_x2, crop_y2 = self._get_enlarged_region(
+                obj_x1, obj_y1, obj_x2, obj_y2, test_dx, 0, w, h
+            )
+            # 计算粘贴区域
+            paste_x1 = crop_x1 + test_dx
+            paste_x2 = crop_x2 + test_dx
             
-            # 如果反向后还是超出，跳过这个物体
-            if new_obj_x1 < 0 or new_obj_x2 > w or new_obj_y1 < 0 or new_obj_y2 > h:
-                return None
+            # 检查边界
+            if paste_x1 < 0 or paste_x2 > w:
+                continue
+            
+            # 检查扩展区域是否与其他物体重叠（只检查扩展部分）
+            # 扩展部分：crop区域 - 原物体区域
+            if test_dx > 0:  # 向左平移，向左扩展
+                extend_x1, extend_y1, extend_x2, extend_y2 = crop_x1, obj_y1, obj_x1, obj_y2
+            else:  # 向右平移，向右扩展
+                extend_x1, extend_y1, extend_x2, extend_y2 = obj_x2, obj_y1, crop_x2, obj_y2
+            
+            extend_has_overlap = self._check_overlap_with_objects(
+                extend_x1, extend_y1, extend_x2, extend_y2, bboxes, w, h, current_bbox=bbox
+            )
+            if extend_has_overlap:
+                continue
+            
+            # 检查粘贴后位置是否与其他物体重叠
+            paste_has_overlap = self._check_overlap_with_objects(
+                paste_x1, obj_y1, paste_x2, obj_y2, bboxes, w, h, current_bbox=bbox
+            )
+            if paste_has_overlap:
+                continue
+            
+            # X 方向可行
+            x_ok = True
+            x_dx = test_dx
+            break
         
-        # 从背景中选择区域（避开所有物体）
-        bg_region = None
-        for attempt in range(self.bg_max_attempts):
-            # 随机选择背景位置
-            bg_x1 = np.random.randint(0, w - obj_w + 1)
-            bg_y1 = np.random.randint(0, h - obj_h + 1)
-            bg_x2 = bg_x1 + obj_w
-            bg_y2 = bg_y1 + obj_h
-            
-            # 检查是否与任何物体重叠
-            overlap = False
-            for bbox_i in bboxes:
-                cx_i, cy_i, bw_i, bh_i = bbox_i
-                x1_i = max(0, int((cx_i - bw_i/2) * w))
-                y1_i = max(0, int((cy_i - bh_i/2) * h))
-                x2_i = min(w, int((cx_i + bw_i/2) * w))
-                y2_i = min(h, int((cy_i + bh_i/2) * h))
-                
-                # 检查重叠
-                if not (bg_x2 <= x1_i or bg_x1 >= x2_i or bg_y2 <= y1_i or bg_y1 >= y2_i):
-                    overlap = True
-                    break
-            
-            if not overlap:
-                # 找到不重叠的背景区域
-                bg_region = target_img[bg_y1:bg_y2, bg_x1:bg_x2].copy()
-                break
+        # --- 检查 Y 方向（只做 Y 平移） ---
+        y_ok = False
+        y_dy = 0
         
-        if bg_region is None:
-            # 无法找到合适的背景区域，跳过这个物体
+        for test_dy in [dy_px, -dy_px]:
+            if test_dy == 0:
+                continue
+            # 计算放大后的裁剪区域
+            crop_x1, crop_y1, crop_x2, crop_y2 = self._get_enlarged_region(
+                obj_x1, obj_y1, obj_x2, obj_y2, 0, test_dy, w, h
+            )
+            # 计算粘贴区域
+            paste_y1 = crop_y1 + test_dy
+            paste_y2 = crop_y2 + test_dy
+            
+            # 检查边界
+            if paste_y1 < 0 or paste_y2 > h:
+                continue
+            
+            # 检查扩展区域是否与其他物体重叠
+            if test_dy > 0:  # 向上平移，向上扩展
+                extend_x1, extend_y1, extend_x2, extend_y2 = obj_x1, crop_y1, obj_x2, obj_y1
+            else:  # 向下平移，向下扩展
+                extend_x1, extend_y1, extend_x2, extend_y2 = obj_x1, obj_y2, obj_x2, crop_y2
+            
+            extend_has_overlap = self._check_overlap_with_objects(
+                extend_x1, extend_y1, extend_x2, extend_y2, bboxes, w, h, current_bbox=bbox
+            )
+            if extend_has_overlap:
+                continue
+            
+            # 检查粘贴后位置是否与其他物体重叠
+            paste_has_overlap = self._check_overlap_with_objects(
+                obj_x1, paste_y1, obj_x2, paste_y2, bboxes, w, h, current_bbox=bbox
+            )
+            if paste_has_overlap:
+                continue
+            
+            # Y 方向可行
+            y_ok = True
+            y_dy = test_dy
+            break
+        
+        # 如果两个方向都不可行，跳过该物体
+        if not x_ok and not y_ok:
             return None
         
-        # 交换：背景贴到原物体位置，物体贴到新位置
-        target_img[obj_y1:obj_y2, obj_x1:obj_x2] = bg_region
-        target_img[new_obj_y1:new_obj_y2, new_obj_x1:new_obj_x2] = object_region
+        # 组合 X 和 Y 方向的平移
+        final_dx_px = x_dx if x_ok else 0
+        final_dy_px = y_dy if y_ok else 0
+        
+        # ========== 执行放大+复制粘贴 ==========
+        # 计算最终放大区域
+        crop_x1, crop_y1, crop_x2, crop_y2 = self._get_enlarged_region(
+            obj_x1, obj_y1, obj_x2, obj_y2, final_dx_px, final_dy_px, w, h
+        )
+        
+        # 计算粘贴区域
+        paste_x1 = crop_x1 + final_dx_px
+        paste_y1 = crop_y1 + final_dy_px
+        paste_x2 = crop_x2 + final_dx_px
+        paste_y2 = crop_y2 + final_dy_px
+        
+        # 处理边界（取有效区域）
+        valid_paste_x1 = max(0, paste_x1)
+        valid_paste_y1 = max(0, paste_y1)
+        valid_paste_x2 = min(w, paste_x2)
+        valid_paste_y2 = min(h, paste_y2)
+        
+        valid_w = valid_paste_x2 - valid_paste_x1
+        valid_h = valid_paste_y2 - valid_paste_y1
+        
+        if valid_w <= 0 or valid_h <= 0:
+            return None
+        
+        # 计算对应的裁剪区域
+        crop_start_x = valid_paste_x1 - paste_x1
+        crop_start_y = valid_paste_y1 - paste_y1
+        valid_crop_x1 = crop_x1 + crop_start_x
+        valid_crop_y1 = crop_y1 + crop_start_y
+        valid_crop_x2 = valid_crop_x1 + valid_w
+        valid_crop_y2 = valid_crop_y1 + valid_h
+        
+        # 提取并粘贴（放大+复制粘贴，无空洞）
+        enlarged_region = target_img[valid_crop_y1:valid_crop_y2, valid_crop_x1:valid_crop_x2].copy()
+        target_img[valid_paste_y1:valid_paste_y2, valid_paste_x1:valid_paste_x2] = enlarged_region
         
         # 计算归一化平移量
-        shift_dx = dx_px / w
-        shift_dy = dy_px / h
-        actual_bbox_px = [new_obj_x1, new_obj_y1, new_obj_x2, new_obj_y2]
+        shift_dx = final_dx_px / w
+        shift_dy = final_dy_px / h
+        
+        # 实际粘贴后的bbox（用于记录）
+        actual_bbox_px = [valid_paste_x1, valid_paste_y1, valid_paste_x2, valid_paste_y2]
         
         return shift_dx, shift_dy, actual_bbox_px
     

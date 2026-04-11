@@ -58,7 +58,7 @@ def main():
         lambda_max=args.lambda_max,
     )
 
-    from ultralytics.models.yolo.detect.train_adv import ADVDetectionTrainer
+    from ultralyticsMultiADV.models.yolo.detect.train_adv import ADVDetectionTrainer
 
     print('=' * 60)
     print('ADV 对抗蒸馏训练（ultralytics 插件方案）')

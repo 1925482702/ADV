@@ -1,0 +1,81 @@
+# YOLOv8 Dual-Path Decoupling Architecture
+# 🔥 全批次镜像双开版本
+
+ch: 6  # 🔥 注意：这里是 6 通道，不是 9 通道！
+nc: 3  # FLIR 数据集
+
+scales: # model compound scaling constants, i.e. 'model=yolov8n.yaml' will call yolov8.yaml with scale 'n'
+  # [depth, width, max_channels]
+  n: [ 0.33, 0.25, 1024 ]  # YOLOv8n summary: 225 layers,  3157200 parameters,  3157184 gradients,   8.9 GFLOPs
+  s: [ 0.33, 0.50, 1024 ]  # YOLOv8s summary: 225 layers, 11166560 parameters, 11166544 gradients,  28.8 GFLOPs
+  m: [ 0.67, 0.75, 768 ]   # YOLOv8m summary: 295 layers, 25902640 parameters, 25902624 gradients,  79.3 GFLOPs
+  l: [ 1.00, 1.00, 512 ]   # YOLOv8l summary: 365 layers, 43691520 parameters, 43691504 gradients, 165.7 GFLOPs
+  x: [ 1.00, 1.25, 512 ]   # YOLOv8x summary: 365 layers, 68229648 parameters, 68229632 gradients, 258.5 GFLOPs
+
+backbone:
+  # 0层：占位符，保存 6 通道输入
+  - [ -1, 1, nn.Identity, [ ] ]           # 0 - 占位符
+  
+  # ====== RGB 分支 ======
+  # 从 0 层提取前 3 个通道
+  - [ 0, 1, Slice, [ 0, 3 ] ]             # 1 - RGB [B, 3, H, W]
+  - [ -1, 1, Conv, [ 64, 3, 2 ] ]         # 2 - RGB Conv P1
+  - [ -1, 1, Conv, [ 128, 3, 2 ] ]        # 3 - RGB Conv P2
+  - [ -1, 3, C2f, [ 128, True ] ]         # 4 - RGB C2f P2
+  - [ -1, 1, Conv, [ 256, 3, 2 ] ]        # 5 - RGB Conv P3
+  - [ -1, 6, C2f, [ 256, True ] ]         # 6 - RGB C2f P3 ★
+  - [ -1, 1, Conv, [ 512, 3, 2 ] ]        # 7 - RGB Conv P4
+  - [ -1, 6, C2f, [ 512, True ] ]         # 8 - RGB C2f P4 ★
+  - [ -1, 1, Conv, [ 1024, 3, 2 ] ]       # 9 - RGB Conv P5
+  - [ -1, 3, C2f, [ 1024, True ] ]        # 10 - RGB C2f P5 ★
+  
+  # ====== IR 分支 ======
+  # 再次从 0 层提取后 3 个通道
+  - [ 0, 1, Slice, [ 3, 6 ] ]             # 11 - IR [B, 3, H, W]
+  - [ -1, 1, Conv, [ 64, 3, 2 ] ]         # 12 - IR Conv P1
+  - [ -1, 1, Conv, [ 128, 3, 2 ] ]        # 13 - IR Conv P2
+  - [ -1, 3, C2f, [ 128, True ] ]         # 14 - IR C2f P2
+  - [ -1, 1, Conv, [ 256, 3, 2 ] ]        # 15 - IR Conv P3
+  - [ -1, 6, C2f, [ 256, True ] ]         # 16 - IR C2f P3 ★
+  - [ -1, 1, Conv, [ 512, 3, 2 ] ]        # 17 - IR Conv P4
+  - [ -1, 6, C2f, [ 512, True ] ]         # 18 - IR C2f P4 ★
+  - [ -1, 1, Conv, [ 1024, 3, 2 ] ]       # 19 - IR Conv P5
+  - [ -1, 3, C2f, [ 1024, True ] ]        # 20 - IR C2f P5 ★
+  
+  # ====== 对齐融合（完整版 M2D-LIF）======
+  
+  # 1. 光照估计网络 (LIF)：统一输入层号 1 (即原始的 3 通道 RGB 图像)
+  - [ 1, 1, LIF, [ ] ]               # 21 - 输出光照权重，给 P3 用
+  - [ 1, 1, LIF, [ ] ]               # 22 - 输出光照权重，给 P4 用
+  - [ 1, 1, LIF, [ ] ]               # 23 - 输出光照权重，给 P5 用
+  
+  # 2. 光照加权融合 (LIFAdd)：将 RGB特征, IR特征, Weight 三者结合
+  - [ [ 6, 16, 21 ], 1, LIFAdd, [ 3 ] ]  # 24 - P3 对齐融合 (rgb_p3, ir_p3, weight_p3)
+  - [ [ 8, 18, 22 ], 1, LIFAdd, [ 4 ] ]  # 25 - P4 对齐融合 (rgb_p4, ir_p4, weight_p4)
+  - [ [ 10, 20, 23 ], 1, LIFAdd, [ 5 ] ] # 26 - P5 对齐融合 (rgb_p5, ir_p5, weight_p5)
+  
+  - [ -1, 1, SPPF, [ 512, 5 ] ]           # 27 - SPPF
+
+head:
+  # ========== 检测分支（对齐特征）==========
+  - [ -1, 1, nn.Upsample, [ None, 2, 'nearest' ] ]
+  - [ [ -1, 25 ], 1, Concat, [ 1 ] ]      # 29 - cat P4
+  - [ -1, 3, C2f, [ 512 ] ]               # 30
+  
+  - [ -1, 1, nn.Upsample, [ None, 2, 'nearest' ] ]
+  - [ [ -1, 24 ], 1, Concat, [ 1 ] ]      # 32 - cat P3
+  - [ -1, 3, C2f, [ 256 ] ]               # 33 (P3/8-small)
+  
+  - [ -1, 1, Conv, [ 256, 3, 2 ] ]
+  - [ [ -1, 30 ], 1, Concat, [ 1 ] ]      # 35 - cat head P4
+  - [ -1, 3, C2f, [ 512 ] ]               # 36 (P4/16-medium)
+  
+  - [ -1, 1, Conv, [ 512, 3, 2 ] ]
+  - [ [ -1, 27 ], 1, Concat, [ 1 ] ]      # 38 - cat head P5
+  - [ -1, 3, C2f, [ 1024 ] ]              # 39 (P5/32-large)
+  
+  # Shift 头（使用不对齐的特征）- 必须放在 Detect 之前！
+  - [ [ 6, 16, 8, 18, 10, 20 ], 1, ShiftHead, [ ] ]  # 40 - Shift 头
+  
+  # 检测头 - 必须放在最后一层！
+  - [ [ 33, 36, 39 ], 1, Detect, [ nc ] ] # 41 - 检测头
