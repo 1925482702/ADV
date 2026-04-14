@@ -12,7 +12,7 @@ import torchvision
 from PIL import Image
 
 from ultralytics.utils import LOCAL_RANK, NUM_THREADS, TQDM, colorstr, is_dir_writeable
-from ultralytics.utils.ops import resample_segments
+from ultralytics.utils.ops import resample_segments, segments2boxes
 
 from .augment import Compose, Format, Instances, LetterBox,PairedLetterBox, classify_augmentations, classify_transforms, v8_transforms,v8_Pairedtransforms
 from .base import BaseDataset
@@ -64,7 +64,7 @@ class YOLODataset(BaseDataset):
             results = pool.imap(func=verify_image_label,
                                 iterable=zip(self.im_files, self.label_files, repeat(self.prefix),
                                              repeat(self.use_keypoints), repeat(len(self.data['names'])), repeat(nkpt),
-                                             repeat(ndim)))
+                                             repeat(ndim), repeat(self.use_obb)))
             pbar = TQDM(results, desc=desc, total=total)
             for im_file, lb, shape, segments, keypoint, nm_f, nf_f, ne_f, nc_f, msg in pbar:
                 nm += nm_f
@@ -74,16 +74,25 @@ class YOLODataset(BaseDataset):
                 if im_file:
                     if '03092' in im_file:
                         pass
+                    # 🔥 对于OBB格式，bboxes 用于中间处理，Format 会从 segments 重新计算 xywhr
+                    if self.use_obb:
+                        if len(segments) > 0:
+                            # 使用 segments 计算轴对齐的 xywh (4列) 用于中间处理
+                            bboxes = segments2boxes(segments)  # xywh
+                        else:
+                            bboxes = np.zeros((0, 4), dtype=np.float32)
+                    else:
+                        bboxes = lb[:, 1:]  # n, 4
                     x['labels'].append(
                         dict(
                             im_file=im_file,
                             shape=shape,
                             cls=lb[:, 0:1],  # n, 1
-                            bboxes=lb[:, 1:],  # n, 4
+                            bboxes=bboxes,  # n, 4 (中间处理用，Format 会从 segments 计算 xywhr)
                             segments=segments,
                             keypoints=keypoint,
                             normalized=True,
-                            bbox_format='xywh'))
+                            bbox_format='xywh'))  # 始终使用 xywh，Format 会处理 OBB
                 if msg:
                     msgs.append(msg)
                 pbar.desc = f'{desc} {nf} images, {nm + ne} backgrounds, {nc} corrupt'

@@ -49,6 +49,10 @@ from ultralytics.utils.torch_utils import (
     strip_optimizer,
 )
 
+# 对抗训练相关导入
+from ultralytics.utils.adversarial import create_single_adv_generator, set_bn_eval, set_bn_train
+from ultralytics.utils.scheduler import create_single_adv_scheduler
+
 
 class BaseTrainer:
     """
@@ -133,6 +137,25 @@ class BaseTrainer:
         # Optimization utils init
         self.lf = None
         self.scheduler = None
+
+        # ========== 对抗训练初始化 ==========
+        self.adv_enabled = getattr(self.args, 'adv_enabled', False)
+        self.epsilon_max = getattr(self.args, 'epsilon_max', 0.05)
+        self.early_layer_idx = getattr(self.args, 'early_layer_idx', 2)
+        
+        if self.adv_enabled:
+            # 创建对抗噪声生成器
+            self.adv_noise_gen = create_single_adv_generator(epsilon=self.epsilon_max)
+            # 创建对抗训练调度器
+            self.adv_scheduler = create_single_adv_scheduler(
+                total_epochs=self.epochs,
+                epsilon_max=self.epsilon_max
+            )
+            LOGGER.info(f"对抗训练已启用: epsilon_max={self.epsilon_max}, early_layer_idx={self.early_layer_idx}")
+        else:
+            self.adv_noise_gen = None
+            self.adv_scheduler = None
+        # ========================================
 
         # Epoch level metrics
         self.best_fitness = None

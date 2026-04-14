@@ -96,7 +96,7 @@ def verify_image(args):
 
 def verify_image_label(args):
     """Verify one image-label pair."""
-    im_file, lb_file, prefix, keypoint, num_cls, nkpt, ndim = args
+    im_file, lb_file, prefix, keypoint, num_cls, nkpt, ndim, use_obb = args
     # Number (missing, found, empty, corrupt), message, segments, keypoints
     nm, nf, ne, nc, msg, segments, keypoints = 0, 0, 0, 0, "", [], None
     try:
@@ -119,16 +119,33 @@ def verify_image_label(args):
             nf = 1  # label found
             with open(lb_file) as f:
                 lb = [x.split() for x in f.read().strip().splitlines() if len(x)]
-                if any(len(x) > 6 for x in lb) and (not keypoint):  # is segment
+                
+                # 🔥 优先检查OBB格式（9列：类别 + 4个点坐标）
+                if any(len(x) == 9 for x in lb) and use_obb:
+                    # OBB格式：类别 + 4个点坐标 (x1,y1,x2,y2,x3,y3,x4,y4)
+                    classes = np.array([x[0] for x in lb], dtype=np.float32)
+                    obb_points = [np.array(x[1:], dtype=np.float32).reshape(-1, 2) for x in lb]  # (N, 4, 2)
+                    lb = np.concatenate((classes.reshape(-1, 1), np.array([x.flatten() for x in obb_points])), 1)  # (N, 9)
+                    segments = obb_points  # 保存OBB点到segments中
+                elif any(len(x) > 6 for x in lb) and (not keypoint):  # is segment
                     classes = np.array([x[0] for x in lb], dtype=np.float32)
                     segments = [np.array(x[1:], dtype=np.float32).reshape(-1, 2) for x in lb]  # (cls, xy1...)
                     lb = np.concatenate((classes.reshape(-1, 1), segments2boxes(segments)), 1)  # (cls, xywh)
+                else:
+                    # 普通检测格式：5列 (类别 + xywh)
+                    lb = np.array(lb, dtype=np.float32)
+                    segments = []
+                
                 lb = np.array(lb, dtype=np.float32)
             nl = len(lb)
             if nl:
                 if keypoint:
                     assert lb.shape[1] == (5 + nkpt * ndim), f"labels require {(5 + nkpt * ndim)} columns each"
                     points = lb[:, 5:].reshape(-1, ndim)[:, :2]
+                elif use_obb:
+                    # 🔥 OBB格式检查（9列：类别 + 8个点坐标）
+                    assert lb.shape[1] == 9, f"OBB labels require 9 columns (class + 8 points), {lb.shape[1]} columns detected"
+                    points = lb[:, 1:]  # 8个点坐标
                 else:
                     assert lb.shape[1] == 5, f"labels require 5 columns, {lb.shape[1]} columns detected"
                     points = lb[:, 1:]
@@ -149,16 +166,30 @@ def verify_image_label(args):
                     msg = f"{prefix}WARNING ⚠️ {im_file}: {nl - len(i)} duplicate labels removed"
             else:
                 ne = 1  # label empty
-                lb = np.zeros((0, (5 + nkpt * ndim) if keypoint else 5), dtype=np.float32)
+                if use_obb:
+                    lb = np.zeros((0, 9), dtype=np.float32)  # OBB格式9列
+                elif keypoint:
+                    lb = np.zeros((0, (5 + nkpt * ndim)), dtype=np.float32)
+                else:
+                    lb = np.zeros((0, 5), dtype=np.float32)
         else:
             nm = 1  # label missing
-            lb = np.zeros((0, (5 + nkpt * ndim) if keypoints else 5), dtype=np.float32)
+            if use_obb:
+                lb = np.zeros((0, 9), dtype=np.float32)  # OBB格式9列
+            elif keypoint:
+                lb = np.zeros((0, (5 + nkpt * ndim)), dtype=np.float32)
+            else:
+                lb = np.zeros((0, 5), dtype=np.float32)
         if keypoint:
             keypoints = lb[:, 5:].reshape(-1, nkpt, ndim)
             if ndim == 2:
                 kpt_mask = np.where((keypoints[..., 0] < 0) | (keypoints[..., 1] < 0), 0.0, 1.0).astype(np.float32)
                 keypoints = np.concatenate([keypoints, kpt_mask[..., None]], axis=-1)  # (nl, nkpt, 3)
-        lb = lb[:, :5]
+        
+        # 🔥 OBB数据不截断前5列，保持完整的9列
+        if not use_obb:
+            lb = lb[:, :5]
+        
         return im_file, lb, shape, segments, keypoints, nm, nf, ne, nc, msg
     except Exception as e:
         nc = 1

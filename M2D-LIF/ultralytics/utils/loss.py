@@ -945,6 +945,204 @@ class v8OBBLoss(v8DetectionLoss):
         return torch.cat((dist2rbox(pred_dist, pred_angle, anchor_points), pred_angle), dim=-1)
 
 
+class v8ShiftOBBLoss(v8OBBLoss):
+    """
+    OBB Detection loss with object-level shift prediction.
+    
+    损失包含：
+    - box loss: 旋转边界框回归损失
+    - cls loss: 分类损失
+    - dfl loss: 分布焦点损失
+    - shift loss: 物体平移预测损失
+    
+    用于双模态 OBB 检测的跨模态交互
+    """
+    
+    def __init__(self, model):
+        """初始化 ShiftOBBLoss，需要从 OBB 层获取参数（因为最后一层是 ShiftHead）"""
+        # 🔥 重要：模型最后一层是 ShiftHead，需要从 OBB 层（倒数第二层）获取参数
+        device = next(model.parameters()).device
+        h = model.args
+        
+        # 找到 OBB 层（可能是 model[-2] 或需要遍历查找）
+        m = None
+        for layer in reversed(model.model):
+            if hasattr(layer, 'reg_max') and layer.reg_max > 0:
+                m = layer
+                break
+        if m is None:
+            m = model.model[-2]  # 兜底：使用倒数第二层
+        
+        self.bce = nn.BCEWithLogitsLoss(reduction='none')
+        self.hyp = h
+        self.stride = m.stride
+        self.nc = m.nc
+        self.no = m.no
+        self.reg_max = m.reg_max
+        self.device = device
+        self.use_dfl = m.reg_max > 1
+        
+        self.assigner = RotatedTaskAlignedAssigner(topk=10, num_classes=self.nc, alpha=0.5, beta=6.0)
+        self.bbox_loss = RotatedBboxLoss(self.reg_max - 1, use_dfl=self.use_dfl).to(device)
+        self.proj = torch.arange(m.reg_max, dtype=torch.float, device=device)
+        
+        # 从模型参数获取 shift loss 权重
+        self.shift_weight = getattr(model.args, 'shift_weight', 1.0)
+        self.shift_mask_weight = getattr(model.args, 'shift_mask_weight', 0.5)
+    
+    def __call__(self, preds, batch):
+        """
+        计算总损失
+        
+        Args:
+            preds: (detect_output, shift_output) 或 detect_output
+            batch: 包含 shift_gt, shift_mask, shift_modality
+        
+        Returns:
+            total_loss, loss_items [box, cls, dfl, shift]
+        """
+        # 从共享内存获取当前权重
+        current_shift_weight = shift_param_manager.get_weight()
+        current_mask_weight = shift_param_manager.get_mask_weight()
+        
+        # 损失数组: [box, cls, dfl, shift]
+        loss = torch.zeros(4, device=self.device)
+        
+        # 分离检测输出和 shift 输出
+        if isinstance(preds, tuple) and len(preds) == 2:
+            obb_out, shift_out = preds[0], preds[1]
+            
+            # 处理 OBB 输出格式
+            # 训练时: (feats_list, angle) 其中 feats_list 是列表
+            # 验证时: (torch.cat([x[0], angle], 1), (x[1], angle))
+            if isinstance(obb_out[0], list):
+                # 训练格式: ([P3, P4, P5], angle)
+                feats_list, pred_angle = obb_out
+            else:
+                # 验证格式: (concat_tensor, (feats_list, angle))
+                feats_list, pred_angle = obb_out[1]
+        else:
+            feats_list, shift_out = preds, None
+            pred_angle = None
+        
+        # 确保 feats_list 是列表格式
+        if not isinstance(feats_list, list):
+            feats_list = [feats_list]
+        
+        batch_size = feats_list[0].shape[0]
+        
+        # 分离预测
+        pred_distri, pred_scores = torch.cat([xi.view(feats_list[0].shape[0], self.no, -1) for xi in feats_list], 2).split(
+            (self.reg_max * 4, self.nc), 1)
+        
+        pred_scores = pred_scores.permute(0, 2, 1).contiguous()
+        pred_distri = pred_distri.permute(0, 2, 1).contiguous()
+        if pred_angle is not None:
+            pred_angle = pred_angle.permute(0, 2, 1).contiguous()
+        
+        # Shift 预测
+        if shift_out is not None and isinstance(shift_out, list):
+            pred_shift_list = []
+            for si in shift_out:
+                pred_shift_list.append(si.view(batch_size, 2, -1))
+            pred_shift = torch.cat(pred_shift_list, 2).permute(0, 2, 1).contiguous()
+        else:
+            pred_shift = None
+        
+        dtype = pred_scores.dtype
+        imgsz = torch.tensor(feats_list[0].shape[2:], device=self.device, dtype=dtype) * self.stride[0]
+        anchor_points, stride_tensor = make_anchors(feats_list, self.stride, 0.5)
+        
+        # 处理目标
+        try:
+            batch_idx = batch['batch_idx'].view(-1, 1)
+            targets = torch.cat((batch_idx, batch['cls'].view(-1, 1), batch['bboxes'].view(-1, 5)), 1)
+            
+            rw, rh = targets[:, 4] * imgsz[0].item(), targets[:, 5] * imgsz[1].item()
+            targets = targets[(rw >= 2) & (rh >= 2)]
+            targets = self.preprocess(targets.to(self.device), batch_size, scale_tensor=imgsz[[1, 0, 1, 0]])
+            gt_labels, gt_bboxes = targets.split((1, 5), 2)
+            mask_gt = gt_bboxes.sum(2, keepdim=True).gt_(0)
+        except RuntimeError as e:
+            raise TypeError('ERROR ❌ OBB dataset incorrectly formatted.') from e
+        
+        # 解码边界框
+        if pred_angle is not None:
+            pred_bboxes = self.bbox_decode(anchor_points, pred_distri, pred_angle)
+        else:
+            # 如果没有角度预测，使用普通 bbox 解码
+            pred_bboxes = self.bbox_decode(anchor_points, pred_distri, torch.zeros(batch_size, pred_distri.shape[1], 1, device=self.device))
+        
+        bboxes_for_assigner = pred_bboxes.clone().detach()
+        bboxes_for_assigner[..., :4] *= stride_tensor
+        
+        _, target_bboxes, target_scores, fg_mask, target_gt_idx = self.assigner(
+            pred_scores.detach().sigmoid(),
+            bboxes_for_assigner.type(gt_bboxes.dtype),
+            anchor_points * stride_tensor, gt_labels, gt_bboxes, mask_gt
+        )
+        
+        target_scores_sum = max(target_scores.sum(), 1)
+        
+        # 分类损失
+        loss[1] = self.bce(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum
+        
+        # 边界框损失
+        if fg_mask.sum():
+            target_bboxes[..., :4] /= stride_tensor
+            loss[0], loss[2] = self.bbox_loss(
+                pred_distri, pred_bboxes, anchor_points, target_bboxes, target_scores, target_scores_sum, fg_mask
+            )
+        else:
+            if pred_angle is not None:
+                loss[0] += (pred_angle * 0).sum()
+        
+        # ========== Shift 损失：只对正样本计算 ==========
+        if pred_shift is not None and fg_mask.sum() > 0 and 'shift_gt' in batch:
+            shift_gt = batch['shift_gt'].to(self.device)
+            shift_mask = batch.get('shift_mask', None)
+            if shift_mask is not None:
+                shift_mask = shift_mask.to(self.device)
+            
+            if len(shift_gt) == 0:
+                pass  # skip shift loss
+            else:
+                # 获取正样本对应的 GT 索引
+                gt_idx_for_fg = target_gt_idx[fg_mask]
+                
+                # 确保索引在有效范围内
+                valid_gt_idx = gt_idx_for_fg < len(shift_gt)
+                gt_idx_for_fg = gt_idx_for_fg[valid_gt_idx]
+                fg_mask_valid = torch.zeros_like(fg_mask, dtype=torch.bool)
+                fg_mask_valid[fg_mask] = valid_gt_idx
+                
+                if len(gt_idx_for_fg) > 0:
+                    pred_shift_fg = pred_shift[fg_mask_valid]
+                    shift_gt_fg = shift_gt[gt_idx_for_fg]
+                    
+                    if pred_shift_fg.shape[0] == shift_gt_fg.shape[0]:
+                        if shift_mask is not None:
+                            shift_mask_fg = shift_mask[gt_idx_for_fg]
+                            # shift_mask=1 权重 1.0，shift_mask=0 权重 current_mask_weight
+                            weights = torch.where(shift_mask_fg > 0.5,
+                                                  torch.ones_like(shift_mask_fg),
+                                                  torch.full_like(shift_mask_fg, current_mask_weight))
+                            
+                            elementwise_loss = F.smooth_l1_loss(pred_shift_fg, shift_gt_fg, reduction='none')
+                            weighted_loss = (elementwise_loss * weights.unsqueeze(1)).mean()
+                            loss[3] = weighted_loss * current_shift_weight * 100
+                        else:
+                            shift_loss = F.smooth_l1_loss(pred_shift_fg, shift_gt_fg, reduction='mean')
+                            loss[3] = shift_loss * current_shift_weight * 100
+        
+        # 应用权重
+        loss[0] *= self.hyp.box
+        loss[1] *= self.hyp.cls
+        loss[2] *= self.hyp.dfl
+        
+        return loss.sum() * batch_size, loss.detach()
+
+
 class v8ShiftDetectionLossV2(v8DetectionLoss):
     """
     V2 版本 Shift Detection Loss

@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-ADV 对抗蒸馏训练 —— 基于 ultralytics 插件方案
+ADV 对抗蒸馏训练 (OBB版本) —— 基于 ultralytics 插件方案
 
 用法:
-    python train_adv.py
-    python train_adv.py --scale s --epochs 100 --batch 16
+    python train_adv_obb.py
+    python train_adv_obb.py --scale s --epochs 100 --batch 16
 """
 
 import argparse
@@ -18,15 +18,23 @@ if str(ROOT) not in sys.path:
 
 
 def main():
-    parser = argparse.ArgumentParser(description='ADV 对抗蒸馏训练')
+    parser = argparse.ArgumentParser(description='ADV 对抗蒸馏训练 (OBB)')
     parser.add_argument('--scale', type=str, default='s', choices=['n', 's', 'm', 'l', 'x'])
     parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--batch', type=int, default=16)
     parser.add_argument('--device', type=int, default=0)
     parser.add_argument('--imgsz', type=int, default=640)
+    parser.add_argument('--data', type=str, default='./data/DroneVehicle.yaml',
+                        help='数据集配置文件 (OBB格式)')
+    parser.add_argument('--model', type=str, default='./model_yaml_obb/yolov8_obb_fusion.yaml',
+                        help='模型配置文件')
     parser.add_argument('--teacher', type=str,
-                        default='./runs/baseline/yolov8s_naive_add2/weights/best.pt',
+                        default='./runs/baseline/yolov8s_obb/weights/best.pt',
                         help='Baseline teacher 权重路径')
+    parser.add_argument('--project', type=str, default='./runs/adv_obb',
+                        help='项目保存路径')
+    parser.add_argument('--name', type=str, default='adv_obb',
+                        help='实验名称')
     # ADV 专用参数
     parser.add_argument('--warmup_frac', type=float, default=0.10, help='Warmup 占比（纯检测）')
     parser.add_argument('--finetune_frac', type=float, default=0.10, help='Finetune 占比（纯检测）')
@@ -34,20 +42,17 @@ def main():
     parser.add_argument('--lambda_max', type=float, default=0.5, help='蒸馏权重最大值')
     args = parser.parse_args()
 
-    # 模型 yaml
-    model_yaml = f'./model_yaml/yolov8_naive_add.yaml'
-
     # ultralytics 训练参数
     overrides = dict(
-        model=model_yaml,
-        data='./data/FLIR.yaml',
+        model=args.model,
+        data=args.data,
         epochs=args.epochs,
         batch=args.batch,
         imgsz=args.imgsz,
         device=args.device,
         workers=8,
-        project='./runs/adv',
-        name=f'yolov8{args.scale}_adv',
+        project=args.project,
+        name=args.name,
     )
 
     # ADV 调度参数
@@ -58,18 +63,19 @@ def main():
         lambda_max=args.lambda_max,
     )
 
-    from ultralytics.models.yolo.detect.train_adv import ADVDetectionTrainer
+    from ultralytics.models.yolo.obb.train_adv import ADVOBBTrainer
 
     print('=' * 60)
-    print('ADV 对抗蒸馏训练（ultralytics 插件方案）')
+    print('ADV 对抗蒸馏训练 (OBB版本)')
     print('=' * 60)
-    print(f'  Model:   {model_yaml}')
+    print(f'  Model:   {args.model}')
+    print(f'  Data:    {args.data}')
     print(f'  Teacher: {args.teacher}')
     print(f'  Epochs:  {args.epochs}')
     print(f'  ADV cfg: {adv_cfg}')
     print('=' * 60)
 
-    trainer = ADVDetectionTrainer(
+    trainer = ADVOBBTrainer(
         overrides=overrides,
         teacher_weights=args.teacher,
         adv_cfg=adv_cfg,

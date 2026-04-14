@@ -10,7 +10,7 @@ import torch.nn as nn
 from ultralytics.nn.modules import *
 from ultralytics.utils import DEFAULT_CFG_DICT, DEFAULT_CFG_KEYS, LOGGER, colorstr, emojis, yaml_load
 from ultralytics.utils.checks import check_requirements, check_suffix, check_yaml
-from ultralytics.utils.loss import v8ClassificationLoss, v8DetectionLoss, v8OBBLoss, v8PoseLoss, v8SegmentationLoss, v8ShiftDetectionLoss, v8ShiftDetectionLossV2
+from ultralytics.utils.loss import v8ClassificationLoss, v8DetectionLoss, v8OBBLoss, v8PoseLoss, v8SegmentationLoss, v8ShiftDetectionLoss, v8ShiftDetectionLossV2, v8ShiftOBBLoss
 from ultralytics.utils.plotting import feature_visualization
 from ultralytics.utils.torch_utils import (fuse_conv_and_bn, fuse_deconv_and_bn, initialize_weights, intersect_dicts,
                                            make_divisible, model_info, scale_img, time_sync)
@@ -239,14 +239,31 @@ class DetectionModel(BaseModel):
         self.inplace = self.yaml.get('inplace', True)
 
         # Build strides
-        m = self.model[-1]  # Detect()
-        if isinstance(m, (Detect, Segment, Pose, OBB)):
+        m = self.model[-1]  # Detect() or ShiftHead
+        # 🔥 处理 ShiftHead 作为最后一层的情况：需要找到 OBB/Detect 层来初始化 stride
+        detect_layer = m
+        if not isinstance(m, (Detect, Segment, Pose, OBB)):
+            # 查找倒数第二个 Detect/OBB 层
+            for layer in reversed(self.model[:-1]):
+                if isinstance(layer, (Detect, Segment, Pose, OBB)):
+                    detect_layer = layer
+                    break
+        
+        if isinstance(detect_layer, (Detect, Segment, Pose, OBB)):
             s = 256  # 2x min stride
-            m.inplace = self.inplace
-            forward = lambda x: self.forward(x)[0] if isinstance(m, (Segment, Pose, OBB)) else self.forward(x)
-            m.stride = torch.tensor([s / x.shape[-2] for x in forward(torch.zeros(1, ch, s, s))])  # forward
-            self.stride = m.stride
-            m.bias_init()  # only run once
+            detect_layer.inplace = self.inplace
+            forward = lambda x: self.forward(x)[0] if isinstance(detect_layer, (Segment, Pose, OBB)) else self.forward(x)
+            # 🔥 对于 OBB/Segment/Pose，forward 返回 (feats_list, ...)，feats_list 是列表
+            forward_out = forward(torch.zeros(1, ch, s, s))
+            if isinstance(forward_out, tuple):
+                forward_out = forward_out[0]  # 取 feats_list
+            if isinstance(forward_out, list):
+                # feats_list 是 [P3, P4, P5] 格式
+                detect_layer.stride = torch.tensor([s / x.shape[-2] for x in forward_out])
+            else:
+                detect_layer.stride = torch.tensor([s / x.shape[-2] for x in forward_out])
+            self.stride = detect_layer.stride
+            detect_layer.bias_init()  # only run once
         else:
             self.stride = torch.Tensor([32])  # default stride for i.e. RTDETR
 
@@ -486,6 +503,36 @@ class OBBModel(DetectionModel):
 
     def init_criterion(self):
         return v8OBBLoss(self)
+
+
+class ShiftOBBModel(OBBModel):
+    """YOLOv8 OBB model with shift prediction for cross-modal alignment."""
+
+    def __init__(self, cfg='yolov8-obb.yaml', ch=6, nc=None, verbose=True):
+        """Initialize ShiftOBBModel."""
+        super().__init__(cfg=cfg, ch=ch, nc=nc, verbose=verbose)
+
+    def loss(self, batch, preds=None):
+        """拦截 batch，注入 shift_modality，计算总 Loss"""
+        if not hasattr(self, 'criterion'):
+            self.criterion = self.init_criterion()
+
+        # 1. 从 batch 中提取 shift_modality，注入给 ShiftHead
+        shift_modality = batch.get('shift_modality', None)
+        for m in self.model:
+            if type(m).__name__ == 'ShiftHead':
+                m.shift_modality = shift_modality
+
+        # 2. 执行前向传播
+        if preds is None:
+            preds = self.forward(batch['img'])
+        
+        # 3. 调用损失函数（preds 已经包含 (obb_output, shift_output)）
+        return self.criterion(preds, batch)
+
+    def init_criterion(self):
+        """初始化损失函数，使用 ShiftOBBLoss"""
+        return v8ShiftOBBLoss(self)
 
 
 class SegmentationModel(DetectionModel):

@@ -2288,21 +2288,16 @@ class ObjectShift(BaseTransform):
             print(f"Warning: Image has {img.shape[2]} channels, expected 6. Shape: {img.shape}")
             return
         
-        # 获取 bboxes（可能是 numpy 数组或 Instances 对象）
-        bboxes = labels.get('bboxes')
-        if bboxes is None:
-            instances = labels.get('instances')
-            if instances is not None:
-                bboxes = instances.bboxes
-        if bboxes is None:
+        # 🔥 优先从 instances 获取数据（支持 OBB 和普通检测）
+        instances = labels.get('instances')
+        if instances is None:
             return
         
-        # 转换为 numpy 数组
-        if isinstance(bboxes, torch.Tensor):
-            bboxes = bboxes.cpu().numpy()
+        # 检查是否是 OBB 数据（segments 长度 > 0 且每个 segment 有 4 个点）
+        is_obb = len(instances.segments) > 0 and instances.segments[0].shape[0] == 4
         
         # 初始化 shift_gt 和 shift_mask
-        n_obj = len(bboxes) if bboxes is not None else 0
+        n_obj = len(instances.segments) if is_obb else len(instances.bboxes)
         labels['shift_gt'] = np.zeros((n_obj, 2), dtype=np.float32)
         labels['shift_mask'] = np.zeros(n_obj, dtype=np.float32)
         labels['shift_modality'] = 0  # 默认 0=RGB 被平移，1=IR 被平移
@@ -2336,18 +2331,23 @@ class ObjectShift(BaseTransform):
         
         # 处理物体平移
         valid_shifts = []
-        shift_info = []  # 记录平移信息：[(idx, shift_dx, shift_dy, bbox, actual_bbox_px), ...]
+        shift_info = []
         for idx in shift_indices:
-            bbox = bboxes[idx]  # xywh 归一化坐标
-            result = self._shift_single_object_v2(target_img, bbox, bboxes, h, w)
+            if is_obb:
+                # 🔥 OBB 数据：使用仿射变换平移 4 个点
+                result = self._shift_single_object_obb(target_img, instances.segments[idx], instances.segments, h, w)
+            else:
+                # 普通检测数据：使用原来的逻辑
+                bbox = instances.bboxes[idx]  # xywh 归一化坐标
+                result = self._shift_single_object_v2(target_img, bbox, instances.bboxes, h, w)
+            
             if result is not None:
                 shift_dx, shift_dy, actual_bbox_px = result
                 if shift_dx != 0 or shift_dy != 0:
-                    # 存储归一化 shift GT（不乘 w, h）
                     labels['shift_gt'][idx] = [shift_dx, shift_dy]
                     labels['shift_mask'][idx] = 1.0
                     valid_shifts.append((shift_dx, shift_dy))
-                    shift_info.append((idx, shift_dx, shift_dy, bbox, actual_bbox_px))
+                    shift_info.append((idx, shift_dx, shift_dy, result))
         
         # 背景打乱（已注释，只保留物体平移）
         # if valid_shifts:
@@ -2767,9 +2767,166 @@ class ObjectShift(BaseTransform):
         return True
     
     def apply_instances(self, labels):
-        """实例级变换（保持检测框不变）"""
+        """实例级变换（双模态设计：检测框不变，不更新坐标）"""
+        # 🔥 双模态 Shift 训练设计：
+        # - IR 模态 (anchor): 检测框位置固定，作为 ground truth
+        # - RGB 模态: 物体区域被平移，但检测框不变
+        # - Shift 预测: 预测 RGB 相对于 IR 的偏移量
+        # 如果检测框跟着平移，Shift 预测就失去了意义
         pass
     
     def apply_semantic(self, labels):
         """语义分割变换（暂不处理）"""
+        pass
+    
+    def _shift_single_object_obb(self, target_img, obb_points, all_obb_points, h, w):
+        """
+        OBB物体平移（使用仿射变换简化逻辑）
+        
+        Args:
+            target_img: 目标模态图像 [H, W, 3]
+            obb_points: 当前物体的4个点坐标 [4, 2] 归一化坐标
+            all_obb_points: 所有物体的OBB坐标 [N, 4, 2] 归一化坐标
+            h, w: 图像高度和宽度
+        
+        Returns:
+            (shift_dx, shift_dy, actual_bbox_px): 
+                shift_dx, shift_dy: 平移量（归一化）
+                actual_bbox_px: 实际粘贴后的bbox像素坐标 [x1, y1, x2, y2]
+                如果无法平移则返回 None
+        """
+        # 转换为像素坐标
+        obb_points_px = obb_points.copy()
+        obb_points_px[:, 0] *= w
+        obb_points_px[:, 1] *= h
+        
+        # 计算OBB的边界框（用于重叠检查）
+        x1, y1 = obb_points_px[:, 0].min(), obb_points_px[:, 1].min()
+        x2, y2 = obb_points_px[:, 0].max(), obb_points_px[:, 1].max()
+        
+        obj_w = x2 - x1
+        obj_h = y2 - y1
+        
+        if obj_w <= 0 or obj_h <= 0:
+            return None
+        
+        # 随机平移量
+        dx_px = np.random.randint(self.min_shift_px, self.max_shift_px + 1)
+        dy_px = np.random.randint(self.min_shift_px, self.max_shift_px + 1)
+        
+        # 随机方向
+        if np.random.random() > 0.5:
+            dx_px = -dx_px
+        if np.random.random() > 0.5:
+            dy_px = -dy_px
+        
+        # 检查平移后是否超出边界
+        new_obb_points_px = obb_points_px.copy()
+        new_obb_points_px[:, 0] += dx_px
+        new_obb_points_px[:, 1] += dy_px
+        
+        new_x1, new_y1 = new_obb_points_px[:, 0].min(), new_obb_points_px[:, 1].min()
+        new_x2, new_y2 = new_obb_points_px[:, 0].max(), new_obb_points_px[:, 1].max()
+        
+        if new_x1 < 0 or new_x2 > w or new_y1 < 0 or new_y2 > h:
+            return None
+        
+        # 检查重叠
+        if self._check_obb_overlap(new_obb_points_px, all_obb_points, w, h, current_obb=obb_points):
+            return None
+        
+        # 🔥 增量扩展：对于 OBB 四边形，沿着平移的反方向扩展特定的边
+        # 
+        # 逻辑：
+        # - 向左平移 (dx < 0) → 右边会露出空洞 → 需要将右侧的顶点向右扩展
+        # - 向右平移 (dx > 0) → 左边会露出空洞 → 需要将左侧的顶点向左扩展
+        # - 向上平移 (dy < 0) → 下边会露出空洞 → 需要将下侧的顶点向下扩展
+        # - 向下平移 (dy > 0) → 上边会露出空洞 → 需要将上侧的顶点向上扩展
+        #
+        # 扩展方式：对于每个顶点，根据其位置决定扩展量
+        # - x 坐标较大的顶点在右侧，需要向右扩展 (当 dx < 0 时)
+        # - x 坐标较小的顶点在左侧，需要向左扩展 (当 dx > 0 时)
+        # - y 坐标较大的顶点在下侧，需要向下扩展 (当 dy < 0 时)
+        # - y 坐标较小的顶点在上侧，需要向上扩展 (当 dy > 0 时)
+        
+        # 计算四个顶点的中心位置
+        center_x = obb_points_px[:, 0].mean()
+        center_y = obb_points_px[:, 1].mean()
+        
+        # 创建扩展后的四边形顶点
+        extended_pts = obb_points_px.copy().astype(np.float32)
+        abs_dx = abs(dx_px)
+        abs_dy = abs(dy_px)
+        
+        for i in range(4):
+            pt = obb_points_px[i]
+            # X 方向扩展：
+            # 向左平移 (dx < 0) 时，右侧的顶点 (x > center_x) 需要向右扩展
+            # 向右平移 (dx > 0) 时，左侧的顶点 (x < center_x) 需要向左扩展
+            if dx_px < 0 and pt[0] > center_x:  # 右侧顶点向右扩展
+                extended_pts[i, 0] = min(w, pt[0] + abs_dx)
+            elif dx_px > 0 and pt[0] < center_x:  # 左侧顶点向左扩展
+                extended_pts[i, 0] = max(0, pt[0] - abs_dx)
+            
+            # Y 方向扩展：
+            # 向上平移 (dy < 0) 时，下侧的顶点 (y > center_y) 需要向下扩展
+            # 向下平移 (dy > 0) 时，上侧的顶点 (y < center_y) 需要向上扩展
+            if dy_px < 0 and pt[1] > center_y:  # 下侧顶点向下扩展
+                extended_pts[i, 1] = min(h, pt[1] + abs_dy)
+            elif dy_px > 0 and pt[1] < center_y:  # 上侧顶点向上扩展
+                extended_pts[i, 1] = max(0, pt[1] - abs_dy)
+        
+        # 1. 创建扩展后的四边形 mask
+        extended_mask = np.zeros((h, w), dtype=np.uint8)
+        cv2.fillPoly(extended_mask, [extended_pts.astype(np.int32)], 1)
+        
+        # 2. 创建原位置的 OBB mask
+        orig_mask = np.zeros((h, w), dtype=np.uint8)
+        orig_pts = obb_points_px.astype(np.int32)
+        cv2.fillPoly(orig_mask, [orig_pts], 1)
+        
+        # 3. 提取扩展区域内的所有像素
+        car_pixels = target_img.copy()
+        car_pixels[extended_mask == 0] = 0  # 扩展区域以外变黑
+        
+        # 4. 将 target_img 中扩展区域的像素擦除（变黑）
+        target_img[extended_mask == 1] = 0
+        
+        # 5. 利用仿射变换矩阵平移
+        M = np.float32([[1, 0, dx_px], [0, 1, dy_px]])
+        shifted_car_layer = cv2.warpAffine(car_pixels, M, (w, h))
+        shifted_mask = cv2.warpAffine(extended_mask, M, (w, h))
+        
+        # 6. 将平移后的内容贴回原图
+        target_img[shifted_mask == 1] = shifted_car_layer[shifted_mask == 1]
+        
+        # 返回归一化平移量
+        shift_dx = dx_px / w
+        shift_dy = dy_px / h
+        
+        return (shift_dx, shift_dy, (new_x1, new_y1, new_x2, new_y2))
+    
+    def _check_obb_overlap(self, obb_points_px, all_obb_points, w, h, current_obb=None):
+        """检查OBB是否与其他物体重叠（使用边界框简化检查）"""
+        current_bbox = self._get_obb_bbox(current_obb, w, h) if current_obb is not None else None
+        
+        for other_obb in all_obb_points:
+            if current_obb is not None and np.allclose(other_obb, current_obb):
+                continue
+            
+            other_bbox = self._get_obb_bbox(other_obb, w, h)
+            
+            # 简化的边界框重叠检查（更精确的方法需要使用OBB重叠算法）
+            if not (current_bbox[2] <= other_bbox[0] or current_bbox[0] >= other_bbox[2] or
+                    current_bbox[3] <= other_bbox[1] or current_bbox[1] >= other_bbox[3]):
+                return True
+        
+        return False
+    
+    def _get_obb_bbox(self, obb_points, w, h):
+        """从OBB点获取边界框"""
+        obb_px = obb_points.copy()
+        obb_px[:, 0] *= w
+        obb_px[:, 1] *= h
+        return (obb_px[:, 0].min(), obb_px[:, 1].min(), obb_px[:, 0].max(), obb_px[:, 1].max())
         pass

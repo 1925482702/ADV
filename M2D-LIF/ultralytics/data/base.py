@@ -164,7 +164,16 @@ class BaseDataset(Dataset):
                 im = cv2.imread(f)
                 if self.hyp.ch > 3:
                     # RGB 在前3通道, IR 在后3通道
-                    im = np.concatenate([im, cv2.imread(self.la_files[i])], axis=2)
+                    im_ir = cv2.imread(self.la_files[i])
+                    # 🔥 对齐尺寸：如果 RGB 和 IR 尺寸不一致，resize 到较小尺寸
+                    if im.shape[:2] != im_ir.shape[:2]:
+                        target_h = min(im.shape[0], im_ir.shape[0])
+                        target_w = min(im.shape[1], im_ir.shape[1])
+                        if im.shape[:2] != (target_h, target_w):
+                            im = cv2.resize(im, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+                        if im_ir.shape[:2] != (target_h, target_w):
+                            im_ir = cv2.resize(im_ir, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+                    im = np.concatenate([im, im_ir], axis=2)
             if im is None:
                 raise FileNotFoundError(f'Image Not Found {f}')
 

@@ -1089,7 +1089,7 @@ class SingleModalObjectShift(BaseTransform):
                 dx_px, dy_px = result
                 shift_records.append((idx, dx_px, dy_px))
         
-        # 更新 bbox（关键区别！bbox 跟着物体移动）
+        # 更新 bbox（单模态：bbox 跟着物体移动）
         for idx, dx_px, dy_px in shift_records:
             cx, cy, bw, bh = bboxes_list[idx]
             new_cx = cx + dx_px / w
@@ -1098,6 +1098,14 @@ class SingleModalObjectShift(BaseTransform):
         
         # 更新 instances（使用 _bboxes.bboxes，因为 bboxes 是只读 property）
         instances._bboxes.bboxes = np.array(bboxes_list, dtype=np.float32)
+        
+        # 更新 segments（OBB 角点坐标）
+        if instances.segments is not None and len(instances.segments) > 0:
+            segments = instances.segments.copy()
+            for idx, dx_px, dy_px in shift_records:
+                segments[idx, :, 0] = np.clip(segments[idx, :, 0] + dx_px / w, 0.0, 1.0)
+                segments[idx, :, 1] = np.clip(segments[idx, :, 1] + dy_px / h, 0.0, 1.0)
+            instances.segments = segments
     
     def apply_instances(self, labels):
         """实例级变换（已在 apply_image 中处理）"""
@@ -1316,7 +1324,30 @@ class SingleModalObjectShift(BaseTransform):
         enlarged_region = img[valid_crop_y1:valid_crop_y2, valid_crop_x1:valid_crop_x2].copy()
         img[valid_paste_y1:valid_paste_y2, valid_paste_x1:valid_paste_x2] = enlarged_region
         
-        return final_dx_px, final_dy_px
+        # ========== 计算物体中心的实际新位置 ==========
+        # 物体在原始裁剪区域中的相对位置
+        # 粘贴后：实际中心 = 粘贴起点 + 物体在裁剪区域中的偏移
+        # 
+        # 关键公式推导：
+        # 物体在原始裁剪区域的偏移 = cx_px - crop_x1
+        # 粘贴后的位置 = paste_x1 + (cx_px - crop_x1) = cx_px + dx_px
+        # 
+        # 但当边界裁剪发生时：
+        # valid_crop_x1 = crop_x1 + (valid_paste_x1 - paste_x1)
+        # 
+        # 所以用 valid 计算也是正确的：
+        # valid_paste_x1 + (cx_px - valid_crop_x1)
+        # = valid_paste_x1 + cx_px - crop_x1 - valid_paste_x1 + paste_x1
+        # = cx_px + paste_x1 - crop_x1 = cx_px + dx_px
+        
+        actual_new_cx_px = valid_paste_x1 + (cx_px - valid_crop_x1)
+        actual_new_cy_px = valid_paste_y1 + (cy_px - valid_crop_y1)
+        
+        # 返回实际移动距离（像素）
+        actual_dx_px = actual_new_cx_px - cx_px
+        actual_dy_px = actual_new_cy_px - cy_px
+        
+        return actual_dx_px, actual_dy_px
 
 
 # TODO: technically this is not an augmentation, maybe we should put this to another files

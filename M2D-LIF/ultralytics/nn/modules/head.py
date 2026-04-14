@@ -554,8 +554,8 @@ class CrossModalShift(nn.Module):
 
         # 可选：降采样以节省显存
         if downsample:
-            self.down = nn.AvgPool2d(2, 2)
-            self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
+            self.down = nn.AvgPool2d(4, 4)  # 🔥 改为 4x 降采样
+            self.up = nn.Upsample(scale_factor=4, mode='bilinear', align_corners=False)
 
         # Q, K, V 投影
         self.q_proj = nn.Conv2d(channels, channels // 2, 1)
@@ -668,7 +668,13 @@ class ShiftHead(nn.Module):
     def __init__(self, ch=()):
         super().__init__()
 
-        # ch 会是一个包含 6 个元素的列表，对应 [rgb_p3, ir_p3, rgb_p4, ir_p4, rgb_p5, ir_p5] 的通道数
+        # ch 会是一个包含 6 或 7 个元素的列表
+        # - 7 个元素: [obb_ch, rgb_p3, ir_p3, rgb_p4, ir_p4, rgb_p5, ir_p5] (obb_ch 可以忽略)
+        # - 6 个元素: [rgb_p3, ir_p3, rgb_p4, ir_p4, rgb_p5, ir_p5]
+        if len(ch) == 7:
+            # 忽略第一个 OBB 通道数
+            ch = ch[1:]
+        
         if len(ch) == 6:
             # 提取 RGB 三个尺度的通道数 (比如 256, 512, 1024)
             ch_rgb = (ch[0], ch[2], ch[4])
@@ -707,20 +713,36 @@ class ShiftHead(nn.Module):
     def forward(self, x):
         """
         Args:
-            x: [rgb_p3, ir_p3, rgb_p4, ir_p4, rgb_p5, ir_p5]
-               或者在推理时可能包含额外输入
+            x: 如果是列表:
+                - [obb_output, rgb_p3, ir_p3, rgb_p4, ir_p4, rgb_p5, ir_p5]
+                - obb_output 是 OBB 层的输出 (feats, angle) 或 feats
+               或者只有特征:
+                - [rgb_p3, ir_p3, rgb_p4, ir_p4, rgb_p5, ir_p5]
 
         Returns:
-            训练时: [shift_p3, shift_p4, shift_p5] 三个尺度的 shift 预测
-            推理时: None (不使用)
+            训练时: (obb_output, [shift_p3, shift_p4, shift_p5])
+            推理时: obb_output
         """
+        # 🔥 检查是否包含 OBB 输出（第一个元素是 tuple 或 OBB 格式）
+        obb_output = None
+        if isinstance(x, list) and len(x) >= 1:
+            first = x[0]
+            # OBB 输出格式：(feats, angle) 或 feats (list of tensors)
+            if isinstance(first, tuple) or (isinstance(first, list) and len(first) > 0 and 
+                                            isinstance(first[0], torch.Tensor) and first[0].dim() == 4):
+                obb_output = first
+                x = x[1:]  # 剩下的是 shift 特征
+        
+        # 检查是否有足够的 shift 特征
         if len(x) < 6:
-            return None
+            # 只有 OBB 输出，没有 shift 特征
+            return obb_output if obb_output is not None else None
 
         rgb_p3, ir_p3, rgb_p4, ir_p4, rgb_p5, ir_p5 = x[:6]
 
         if not self.training:
-            return None
+            # 推理时只返回 OBB 输出
+            return obb_output
 
         # 1. 从自己身上取下刚才挂载的 shift_modality
         modality = getattr(self, 'shift_modality', None)
@@ -730,10 +752,16 @@ class ShiftHead(nn.Module):
             B = rgb_p3.shape[0]
             import torch
             modality = torch.zeros(B, device=rgb_p3.device, dtype=torch.long)
+            # 只在训练时打印警告（排除模型 summary 阶段）
+            # if self.training:
+            #     print("WARNING: shift_modality not set, using default 0 (RGB shifted)")
 
         # 2. 把 modality 传给注意力模块
         shift_p3 = self.shift_p3(rgb_p3, ir_p3, modality)  # [B, 2, H, W]
         shift_p4 = self.shift_p4(rgb_p4, ir_p4, modality)
         shift_p5 = self.shift_p5(rgb_p5, ir_p5, modality)
 
-        return [shift_p3, shift_p4, shift_p5]
+        shift_output = [shift_p3, shift_p4, shift_p5]
+        
+        # 🔥 返回 (obb_output, shift_output) 元组
+        return (obb_output, shift_output) if obb_output is not None else shift_output
