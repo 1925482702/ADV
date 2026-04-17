@@ -7,11 +7,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-__all__ = ('Add', 'Conv', 'Conv2', 'LightConv', 'DWConv', 'DWConvTranspose2d', 'ConvTranspose', 'Focus', 'GhostConv',
+__all__ = ('Add', 'FusionAdd', 'Conv', 'Conv2', 'LightConv', 'DWConv', 'DWConvTranspose2d', 'ConvTranspose', 'Focus', 'GhostConv',
            'ChannelAttention', 'SpatialAttention', 'CBAM', 'Concat', 'RepConv')
-
-
-
 
 
 class Add(nn.Module):
@@ -24,6 +21,104 @@ class Add(nn.Module):
     def forward(self, x):
         """Forward pass to add two tensors."""
         return torch.add(0.5*x[0], 0.5*x[1])
+
+
+class FusionAdd(nn.Module):
+    """
+    可学习的双模态特征融合
+    
+    根据输入特征通道数自动选择对应的融合卷积层进行特征对齐和融合。
+    解决两个独立训练的 backbone 特征分布不一致的问题。
+    
+    使用方法：
+        在 YAML 中：- [ [ RGB_feat, IR_feat ], 1, FusionAdd, [ ] ]
+        
+    工作原理：
+        1. 检测输入特征的通道数
+        2. 根据通道数匹配或创建对应的融合层
+        3. 对两个模态分别做 1x1 卷积对齐
+        4. 相加得到融合特征
+    """
+    
+    # 默认通道数配置 (YOLOv8 各尺度的典型值)
+    DEFAULT_CHANNELS = {
+        64: 0,    # P1/2
+        128: 1,   # P2/4  
+        192: 2,   # P3/8 (YOLOv8s)
+        256: 2,   # P3/8 (YOLOv8m)
+        384: 3,   # P4/16 (YOLOv8s)
+        512: 3,   # P4/16 (YOLOv8m/l)
+        576: 4,   # P5/32 (YOLOv8m)
+        768: 4,   # P5/32 (YOLOv8l)
+        1024: 4,  # P5/32 (YOLOv8x)
+    }
+
+    def __init__(self, channels_list=None):
+        """
+        Args:
+            channels_list: 可选，预定义的通道数列表
+                          如 [256, 512, 512] 表示 P3/P4/P5 的通道数
+        """
+        super().__init__()
+        self.fusion_layers = nn.ModuleDict()
+        self._initialized_channels = set()
+        
+        # 如果提供了通道数列表，预创建融合层
+        if channels_list is not None:
+            for c in channels_list:
+                self._create_fusion_layer(c)
+
+    def _create_fusion_layer(self, channels):
+        """创建单个尺度的融合层"""
+        key = str(channels)
+        if key in self.fusion_layers:
+            return
+        
+        self.fusion_layers[key] = nn.Sequential(
+            nn.Conv2d(channels, channels, 1, bias=False),
+            nn.BatchNorm2d(channels),
+        )
+        self._initialized_channels.add(channels)
+
+    def _get_fusion_layer(self, channels, device):
+        """获取或创建对应通道数的融合层"""
+        key = str(channels)
+        
+        # 如果还没有这个通道数的融合层，动态创建
+        if key not in self.fusion_layers:
+            self._create_fusion_layer(channels)
+            # 移动到正确的设备
+            self.fusion_layers[key] = self.fusion_layers[key].to(device)
+        
+        return self.fusion_layers[key]
+
+    def forward(self, x):
+        """
+        前向传播
+        
+        Args:
+            x: 包含两个元素的列表或元组 [rgb_feat, ir_feat]
+               rgb_feat: RGB 模态特征 [B, C, H, W]
+               ir_feat: IR 模态特征 [B, C, H, W]
+        
+        Returns:
+            fused: 融合后的特征 [B, C, H, W]
+        """
+        rgb_feat, ir_feat = x[0], x[1]
+        channels = rgb_feat.shape[1]
+        device = rgb_feat.device
+        
+        # 获取对应通道数的融合层
+        fusion_layer = self._get_fusion_layer(channels, device)
+        
+        # 分别对两个模态进行特征对齐，然后相加
+        rgb_aligned = fusion_layer(rgb_feat)
+        ir_aligned = fusion_layer(ir_feat)
+        
+        return rgb_aligned + ir_aligned
+    
+    def __repr__(self):
+        return f"FusionAdd(channels={list(self._initialized_channels)})"
 
 
 def autopad(k, p=None, d=1):  # kernel, padding, dilation

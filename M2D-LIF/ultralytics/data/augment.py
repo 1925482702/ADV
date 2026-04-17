@@ -2593,7 +2593,7 @@ class ObjectShift(BaseTransform):
         enlarged_region = target_img[valid_crop_y1:valid_crop_y2, valid_crop_x1:valid_crop_x2].copy()
         target_img[valid_paste_y1:valid_paste_y2, valid_paste_x1:valid_paste_x2] = enlarged_region
         
-        # 计算归一化平移量
+        # 计算归一化平移量（乘以 100 扩大量级）
         shift_dx = final_dx_px / w
         shift_dy = final_dy_px / h
         
@@ -2900,9 +2900,9 @@ class ObjectShift(BaseTransform):
         # 6. 将平移后的内容贴回原图
         target_img[shifted_mask == 1] = shifted_car_layer[shifted_mask == 1]
         
-        # 返回归一化平移量
-        shift_dx = dx_px / w
-        shift_dy = dy_px / h
+        # 返回归一化平移量（乘以 100 扩大量级）
+        shift_dx = dx_px / w 
+        shift_dy = dy_px / h 
         
         return (shift_dx, shift_dy, (new_x1, new_y1, new_x2, new_y2))
     

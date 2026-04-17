@@ -12,7 +12,8 @@ from .conv import Conv, DWConv, GhostConv, LightConv, RepConv
 from .transformer import TransformerBlock
 
 __all__ = ('DFL', 'HGBlock', 'HGStem', 'SPP', 'SPPF', 'C1', 'C2', 'C3', 'C2f', 'C3x', 'C3TR', 'C3Ghost',
-    'GhostBottleneck', 'Bottleneck', 'BottleneckCSP', 'Proto', 'RepC3', 'ResNetLayer', 'IN', 'Multiin', 'MF', 'LIF', 'LIFAdd')
+    'GhostBottleneck', 'Bottleneck', 'BottleneckCSP', 'Proto', 'RepC3', 'ResNetLayer', 'IN', 'Multiin', 'MF', 'LIF', 'LIFAdd',
+    'FrozenBackbone', 'DualBranchFrozen')
 
 import torch
 from torch.nn import init, Sequential
@@ -568,3 +569,140 @@ class ResNetLayer(nn.Module):
 #         """Decode bounding boxes."""
 #
 #         return dist2bbox(self.dfl(bboxes), self.anchors.unsqueeze(0), xywh=True, dim=1) * self.strides
+
+
+class FrozenBackbone(nn.Module):
+    """
+    冻结的 Backbone 模块，从预训练 teacher 模型加载权重并冻结。
+    
+    用于知识蒸馏场景，teacher backbone 参数不参与训练。
+    
+    Args:
+        weight_path: 预训练 teacher 模型路径 (.pt 文件)
+        c1: 输入通道数 (默认 3，单模态)
+    """
+    
+    def __init__(self, weight_path=None, c1=3):
+        super().__init__()
+        self.c1 = c1
+        self.weight_path = weight_path
+        
+        # 标准 YOLOv8 backbone 结构 (layers 0-9)
+        # P1/2: Conv(64, 3, 2), Conv(128, 3, 2)
+        # P2/4: C2f(128), Conv(256, 3, 2)  
+        # P3/8: C2f(256), Conv(512, 3, 2)
+        # P4/16: C2f(512), Conv(1024, 3, 2)
+        # P5/32: C2f(1024), SPPF(512)
+        
+        self.stem = nn.Sequential(
+            Conv(c1, 64, 3, 2),    # layer 0: P1/2
+            Conv(64, 128, 3, 2),   # layer 1: P2/4
+        )
+        
+        self.stage2 = nn.Sequential(
+            C2f(128, 128, 3, shortcut=True),  # layer 2
+            Conv(128, 256, 3, 2),              # layer 3: P3/8
+        )
+        
+        self.stage3 = nn.Sequential(
+            C2f(256, 256, 6, shortcut=True),  # layer 4
+            Conv(256, 512, 3, 2),              # layer 5: P4/16
+        )
+        
+        self.stage4 = nn.Sequential(
+            C2f(512, 512, 6, shortcut=True),  # layer 6
+            Conv(512, 1024, 3, 2),            # layer 7: P5/32
+        )
+        
+        self.stage5 = nn.Sequential(
+            C2f(1024, 1024, 3, shortcut=True),  # layer 8
+            SPPF(1024, 512, 5),                  # layer 9
+        )
+        
+        # 如果提供了权重路径，加载预训练权重
+        if weight_path is not None:
+            self._load_pretrained_weights(weight_path)
+        
+        # 冻结所有参数
+        self._freeze()
+    
+    def _load_pretrained_weights(self, weight_path):
+        """从预训练 teacher 模型加载权重"""
+        ckpt = torch.load(weight_path, map_location='cpu', weights_only=False)
+        if 'model' in ckpt:
+            teacher_model = ckpt['model']
+            teacher_state = teacher_model.state_dict()
+        else:
+            teacher_state = ckpt
+        
+        # 将 teacher backbone 权重映射到本模块
+        # Teacher layers 0-9 对应我们的 backbone
+        new_state = {}
+        for name, param in self.named_parameters():
+            # 将我们的参数名映射到 teacher 的参数名
+            teacher_name = f'model.{name}'
+            if teacher_name in teacher_state:
+                new_state[name] = teacher_state[teacher_name]
+        
+        if new_state:
+            self.load_state_dict(new_state, strict=False)
+            print(f"[FrozenBackbone] 加载了 {len(new_state)} 个参数 from {weight_path}")
+        else:
+            print(f"[FrozenBackbone] 警告: 未找到匹配的参数 from {weight_path}")
+    
+    def _freeze(self):
+        """冻结所有参数"""
+        for param in self.parameters():
+            param.requires_grad = False
+    
+    def forward(self, x):
+        """前向传播，返回多尺度特征"""
+        x = self.stem(x)
+        p2 = self.stage2(x)
+        p3 = self.stage3(p2)
+        p4 = self.stage4(p3)
+        p5 = self.stage5(p4)
+        return p2, p3, p4, p5  # 返回多尺度特征
+
+
+class DualBranchFrozen(nn.Module):
+    """
+    双分支冻结 Backbone，用于 RGB-IR 双模态融合。
+    
+    使用两个独立的冻结 backbone (RGB teacher 和 IR teacher)。
+    
+    Args:
+        rgb_weight: RGB teacher 权重路径
+        ir_weight: IR teacher 权重路径
+    """
+    
+    def __init__(self, rgb_weight=None, ir_weight=None):
+        super().__init__()
+        
+        # 两个冻结 backbone，分别用于 RGB 和 IR
+        self.rgb_backbone = FrozenBackbone(weight_path=rgb_weight, c1=3)
+        self.ir_backbone = FrozenBackbone(weight_path=ir_weight, c1=3)
+        
+        print(f"[DualBranchFrozen] 初始化完成:")
+        print(f"  RGB backbone: {rgb_weight}")
+        print(f"  IR backbone: {ir_weight}")
+    
+    def forward(self, x):
+        """
+        双分支 backbone 前向传播
+        
+        Args:
+            x: 输入张量，形状 [B, 6, H, W] (RGB + IR 拼接)
+        
+        Returns:
+            两个分支的多尺度特征元组
+        """
+        # 分离 RGB 和 IR
+        rgb_input = x[:, :3, :, :]  # 前 3 通道
+        ir_input = x[:, 3:, :, :]   # 后 3 通道
+        
+        # 从两个分支提取特征
+        rgb_features = self.rgb_backbone(rgb_input)   # (p2, p3, p4, p5)
+        ir_features = self.ir_backbone(ir_input)       # (p2, p3, p4, p5)
+        
+        return rgb_features, ir_features

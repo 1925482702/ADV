@@ -1,55 +1,48 @@
-# 联合退火策略 (Joint Annealing Strategy)
-# 核心思想：温和预热 -> 长线主力 -> 极限施压 -> 纯净收官
+# L-shape shift training schedule
+# Progressive shift ratio increase
 
 schedule_type: step_up_extreme
-description: "联合退火：0.3 -> 0.5 -> 0.7 -> 0.9极限施压 -> 0同步关闭Mosaic"
+description: "L-shape annealing: warmup -> transition -> main -> extreme -> pure"
 
 total_epochs: 120
 
 stages:
-  # ========== 阶段 1: 热身期 (15 Epochs) ==========
   - name: "warmup"
     start_epoch: 0
     end_epoch: 14
     shift_ratio: 0.3
     shift_weight: 0.5
     shift_mask_weight: 0.2
-    description: "热身阶段：30%平移，稳定初始梯度"
+    description: "warmup phase: 30% shift"
 
-  # ========== 阶段 2: 过渡期 (15 Epochs) ==========
   - name: "transition"
     start_epoch: 15
     end_epoch: 29
     shift_ratio: 0.5
     shift_weight: 0.8
     shift_mask_weight: 0.2
-    description: "过渡阶段：50%平移，建立初步对齐"
+    description: "transition phase: 50% shift"
 
-  # ========== 阶段 3: 主力抗压期 (70 Epochs) ==========
   - name: "main_battle"
     start_epoch: 30
     end_epoch: 99
     shift_ratio: 0.7
     shift_weight: 1.0
     shift_mask_weight: 0.2
-    description: "主力阶段：70%满载训练，长线固化跨模态特征"
+    description: "main phase: 70% shift"
 
-  # ========== 阶段 4: 极限施压期 (10 Epochs) ==========
-  # 权重拉满，逼迫网络完全依赖 Cross-Attention
   - name: "extreme_pressure"
     start_epoch: 100
     end_epoch: 109
     shift_ratio: 0.9
     shift_weight: 1.0
     shift_mask_weight: 0.2
-    description: "极限淬火：90%平移，剥夺空间先验，强制像素级匹配"
+    description: "extreme phase: 90% shift"
 
-  # ========== 阶段 5: 纯净收敛期 (10 Epochs) ==========
-  # 务必确保命令行或 args 中设置了 close_mosaic=10
   - name: "pure_finetuning"
     start_epoch: 110
     end_epoch: 119
     shift_ratio: 0.0
-    shift_weight: 0.1      # 几乎忽略 shift_loss，算力全部给到主检测任务
-    shift_mask_weight: 0.0 # 完全不管未平移样本
-    description: "双重退火：0%平移 + 关闭Mosaic，纯净真实数据微调"
+    shift_weight: 0.1
+    shift_mask_weight: 0.0
+    description: "pure finetuning: 0% shift"

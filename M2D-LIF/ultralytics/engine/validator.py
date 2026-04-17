@@ -114,7 +114,14 @@ class BaseValidator:
             model = trainer.ema.ema or trainer.model
             model = model.half() if self.args.half else model.float()
             # self.model = model
-            self.loss = torch.zeros_like(trainer.loss_items, device=trainer.device)
+            # 🔥 修复：蒸馏训练时 loss_items 可能有 6 项，但验证时只需要前 4 项
+            loss_items_for_init = trainer.loss_items
+            if hasattr(trainer, 'BASE_LOSS_NAMES'):
+                # 只使用基础 loss 项数
+                loss_items_for_init = trainer.loss_items[:len(trainer.BASE_LOSS_NAMES)]
+            elif hasattr(trainer, 'loss_names') and len(trainer.loss_names) == 4:
+                loss_items_for_init = trainer.loss_items[:4]
+            self.loss = torch.zeros_like(loss_items_for_init, device=trainer.device)
             # 检查是否是 ShiftDetectionTrainer（有 4 个 loss）
             if hasattr(trainer, 'loss_names') and len(trainer.loss_names) == 4:
                 # 保留 4 个 loss 项

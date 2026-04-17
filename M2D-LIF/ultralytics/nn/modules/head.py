@@ -5,6 +5,7 @@ import math
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.nn.init import constant_, xavier_uniform_
 
 from ultralytics.utils.tal import TORCH_1_10, dist2bbox, dist2rbox, make_anchors
@@ -14,7 +15,7 @@ from .conv import Conv
 from .transformer import MLP, DeformableTransformerDecoder, DeformableTransformerDecoderLayer
 from .utils import bias_init_with_prob, linear_init_
 
-__all__ = {'Detect', 'Segment', 'Pose', 'Classify', 'OBB', 'RTDETRDecoder', 'ShiftDetect', 'CrossModalShift', 'ShiftHead'}
+__all__ = {'Detect', 'Segment', 'Pose', 'Classify', 'OBB', 'RTDETRDecoder', 'ShiftDetect', 'CrossModalShift', 'ShiftHead', 'SimpleCrossModalShift', 'SimpleShiftHead'}
 
 
 
@@ -564,7 +565,7 @@ class CrossModalShift(nn.Module):
 
         self.out_proj = nn.Conv2d(channels // 2, channels, 1)
 
-        # Shift 预测头
+        # Shift 预测头 (原始结构)
         self.shift_head = nn.Sequential(
             nn.Conv2d(channels * 3, channels, 3, padding=1),
             nn.BatchNorm2d(channels),
@@ -592,6 +593,16 @@ class CrossModalShift(nn.Module):
             shift_pred: [B, 2, H, W]
         """
         B, C, H, W = rgb_feat.shape
+        
+        # 🔥 尺寸对齐：如果 RGB 和 IR 尺寸不一致，对齐到较小尺寸
+        if ir_feat.shape[2:] != rgb_feat.shape[2:]:
+            target_h = min(rgb_feat.shape[2], ir_feat.shape[2])
+            target_w = min(rgb_feat.shape[3], ir_feat.shape[3])
+            if rgb_feat.shape[2] != target_h or rgb_feat.shape[3] != target_w:
+                rgb_feat = F.interpolate(rgb_feat, size=(target_h, target_w), mode='bilinear', align_corners=False)
+            if ir_feat.shape[2] != target_h or ir_feat.shape[3] != target_w:
+                ir_feat = F.interpolate(ir_feat, size=(target_h, target_w), mode='bilinear', align_corners=False)
+            H, W = target_h, target_w
 
         # 将 shift_modality 移动到与特征图相同的设备上
         shift_modality = shift_modality.to(rgb_feat.device)
@@ -668,6 +679,10 @@ class ShiftHead(nn.Module):
     def __init__(self, ch=()):
         super().__init__()
 
+        # 🔥 处理嵌套列表情况：ch 可能是 [[c1, c2, ...]] 格式
+        if isinstance(ch, list) and len(ch) == 1 and isinstance(ch[0], list):
+            ch = ch[0]
+
         # ch 会是一个包含 6 或 7 个元素的列表
         # - 7 个元素: [obb_ch, rgb_p3, ir_p3, rgb_p4, ir_p4, rgb_p5, ir_p5] (obb_ch 可以忽略)
         # - 6 个元素: [rgb_p3, ir_p3, rgb_p4, ir_p4, rgb_p5, ir_p5]
@@ -677,17 +692,17 @@ class ShiftHead(nn.Module):
         
         if len(ch) == 6:
             # 提取 RGB 三个尺度的通道数 (比如 256, 512, 1024)
-            ch_rgb = (ch[0], ch[2], ch[4])
-            ch_ir = (ch[1], ch[3], ch[5])
+            self.ch_rgb = (ch[0], ch[2], ch[4])
+            self.ch_ir = (ch[1], ch[3], ch[5])
         else:
             # 兜底默认值
-            ch_rgb = (256, 512, 1024)
-            ch_ir = (256, 512, 1024)
+            self.ch_rgb = (256, 512, 1024)
+            self.ch_ir = (256, 512, 1024)
 
         # 三个尺度的交叉注意力模块
-        self.shift_p3 = CrossModalShift(ch_rgb[0])
-        self.shift_p4 = CrossModalShift(ch_rgb[1])
-        self.shift_p5 = CrossModalShift(ch_rgb[2])
+        self.shift_p3 = CrossModalShift(self.ch_rgb[0])
+        self.shift_p4 = CrossModalShift(self.ch_rgb[1])
+        self.shift_p5 = CrossModalShift(self.ch_rgb[2])
 
         self.training = True
 
@@ -713,55 +728,168 @@ class ShiftHead(nn.Module):
     def forward(self, x):
         """
         Args:
-            x: 如果是列表:
-                - [obb_output, rgb_p3, ir_p3, rgb_p4, ir_p4, rgb_p5, ir_p5]
-                - obb_output 是 OBB 层的输出 (feats, angle) 或 feats
-               或者只有特征:
-                - [rgb_p3, ir_p3, rgb_p4, ir_p4, rgb_p5, ir_p5]
+            x: RGB/IR 独立特征列表 [rgb_p3, ir_p3, rgb_p4, ir_p4, rgb_p5, ir_p5]
+               或者模型初始化时的嵌套列表
 
         Returns:
-            训练时: (obb_output, [shift_p3, shift_p4, shift_p5])
-            推理时: obb_output
+            训练时: [shift_p3, shift_p4, shift_p5]
+            推理时: None
         """
-        # 🔥 检查是否包含 OBB 输出（第一个元素是 tuple 或 OBB 格式）
-        obb_output = None
-        if isinstance(x, list) and len(x) >= 1:
-            first = x[0]
-            # OBB 输出格式：(feats, angle) 或 feats (list of tensors)
-            if isinstance(first, tuple) or (isinstance(first, list) and len(first) > 0 and 
-                                            isinstance(first[0], torch.Tensor) and first[0].dim() == 4):
-                obb_output = first
-                x = x[1:]  # 剩下的是 shift 特征
+        # 🔥 处理模型初始化时的输入格式
+        if not isinstance(x, list):
+            return None
         
-        # 检查是否有足够的 shift 特征
-        if len(x) < 6:
-            # 只有 OBB 输出，没有 shift 特征
-            return obb_output if obb_output is not None else None
-
-        rgb_p3, ir_p3, rgb_p4, ir_p4, rgb_p5, ir_p5 = x[:6]
+        # 展平嵌套列表
+        flat_x = []
+        for item in x:
+            if isinstance(item, torch.Tensor):
+                flat_x.append(item)
+            elif isinstance(item, list):
+                flat_x.extend([i for i in item if isinstance(i, torch.Tensor)])
+        
+        # 🔥 根据已知通道数筛选正确的特征
+        # 期望通道数: (rgb_p3, ir_p3, rgb_p4, ir_p4, rgb_p5, ir_p5)
+        expected_channels = (self.ch_rgb[0], self.ch_ir[0], self.ch_rgb[1], self.ch_ir[1], self.ch_rgb[2], self.ch_ir[2])
+        
+        filtered = []
+        for tensor in flat_x:
+            if len(filtered) < 6 and tensor.dim() == 4 and tensor.shape[1] == expected_channels[len(filtered)]:
+                filtered.append(tensor)
+        
+        if len(filtered) < 6:
+            return None
+        
+        rgb_p3, ir_p3, rgb_p4, ir_p4, rgb_p5, ir_p5 = filtered[:6]
 
         if not self.training:
-            # 推理时只返回 OBB 输出
-            return obb_output
+            return None
 
-        # 1. 从自己身上取下刚才挂载的 shift_modality
+        # 获取 shift_modality
         modality = getattr(self, 'shift_modality', None)
-
-        # 兜底保护：如果在验证/推理时没有传入，默认全是 0 (RGB被平移)
         if modality is None:
             B = rgb_p3.shape[0]
-            import torch
             modality = torch.zeros(B, device=rgb_p3.device, dtype=torch.long)
-            # 只在训练时打印警告（排除模型 summary 阶段）
-            # if self.training:
-            #     print("WARNING: shift_modality not set, using default 0 (RGB shifted)")
 
-        # 2. 把 modality 传给注意力模块
-        shift_p3 = self.shift_p3(rgb_p3, ir_p3, modality)  # [B, 2, H, W]
+        # 计算三个尺度的 shift 预测
+        shift_p3 = self.shift_p3(rgb_p3, ir_p3, modality)
         shift_p4 = self.shift_p4(rgb_p4, ir_p4, modality)
         shift_p5 = self.shift_p5(rgb_p5, ir_p5, modality)
 
-        shift_output = [shift_p3, shift_p4, shift_p5]
+        return [shift_p3, shift_p4, shift_p5]
+
+
+class SimpleCrossModalShift(nn.Module):
+    """
+    简化版跨模态 Shift 预测模块（无注意力机制）
+    
+    使用简单的三层卷积处理拼接后的 RGB+IR 特征
+    计算量远小于 CrossModalShift，适合快速实验
+    """
+    
+    def __init__(self, channels):
+        super().__init__()
         
-        # 🔥 返回 (obb_output, shift_output) 元组
-        return (obb_output, shift_output) if obb_output is not None else shift_output
+        # 简单的三层卷积
+        self.conv = nn.Sequential(
+            nn.Conv2d(channels * 2, channels, 3, padding=1),  # 输入: RGB+IR 拼接
+            nn.BatchNorm2d(channels),
+            nn.SiLU(),
+            nn.Conv2d(channels, channels // 2, 3, padding=1),
+            nn.BatchNorm2d(channels // 2),
+            nn.SiLU(),
+            nn.Conv2d(channels // 2, 2, 1)  # 输出: dx, dy
+        )
+    
+    def forward(self, rgb_feat, ir_feat, shift_modality=None):
+        """
+        Args:
+            rgb_feat: [B, C, H, W]
+            ir_feat: [B, C, H, W]
+            shift_modality: 忽略，保持接口一致
+        
+        Returns:
+            shift_pred: [B, 2, H, W]
+        """
+        # 尺寸对齐
+        if ir_feat.shape[2:] != rgb_feat.shape[2:]:
+            target_h = min(rgb_feat.shape[2], ir_feat.shape[2])
+            target_w = min(rgb_feat.shape[3], ir_feat.shape[3])
+            rgb_feat = F.interpolate(rgb_feat, size=(target_h, target_w), mode='bilinear', align_corners=False)
+            ir_feat = F.interpolate(ir_feat, size=(target_h, target_w), mode='bilinear', align_corners=False)
+        
+        # 拼接后卷积
+        concat_feat = torch.cat([rgb_feat, ir_feat], dim=1)
+        return self.conv(concat_feat)
+
+
+class SimpleShiftHead(nn.Module):
+    """
+    简化版 Shift 预测头（无注意力机制）
+    
+    使用简单的卷积层替代 CrossModalShift 的注意力机制
+    计算量显著降低，适合快速对比实验
+    """
+    
+    def __init__(self, ch=()):
+        super().__init__()
+        
+        # 处理嵌套列表情况
+        if isinstance(ch, list) and len(ch) == 1 and isinstance(ch[0], list):
+            ch = ch[0]
+        
+        if len(ch) == 7:
+            ch = ch[1:]
+        
+        if len(ch) == 6:
+            self.ch_rgb = (ch[0], ch[2], ch[4])
+            self.ch_ir = (ch[1], ch[3], ch[5])
+        else:
+            self.ch_rgb = (256, 512, 1024)
+            self.ch_ir = (256, 512, 1024)
+        
+        # 三个尺度的简化卷积模块
+        self.shift_p3 = SimpleCrossModalShift(self.ch_rgb[0])
+        self.shift_p4 = SimpleCrossModalShift(self.ch_rgb[1])
+        self.shift_p5 = SimpleCrossModalShift(self.ch_rgb[2])
+        
+        # 兼容属性
+        self.stride = torch.tensor([8., 16., 32.])
+        self.nc = 80
+        self.no = 2
+        self.reg_max = 0
+        self.nl = 3
+    
+    def forward(self, x):
+        """简化的前向传播"""
+        if not isinstance(x, list):
+            return None
+        
+        # 展平嵌套列表
+        flat_x = []
+        for item in x:
+            if isinstance(item, torch.Tensor):
+                flat_x.append(item)
+            elif isinstance(item, list):
+                flat_x.extend([i for i in item if isinstance(i, torch.Tensor)])
+        
+        # 根据通道数筛选
+        expected_channels = (self.ch_rgb[0], self.ch_ir[0], self.ch_rgb[1], self.ch_ir[1], self.ch_rgb[2], self.ch_ir[2])
+        filtered = []
+        for tensor in flat_x:
+            if len(filtered) < 6 and tensor.dim() == 4 and tensor.shape[1] == expected_channels[len(filtered)]:
+                filtered.append(tensor)
+        
+        if len(filtered) < 6:
+            return None
+        
+        rgb_p3, ir_p3, rgb_p4, ir_p4, rgb_p5, ir_p5 = filtered[:6]
+        
+        if not self.training:
+            return None
+        
+        # 计算三个尺度的 shift 预测
+        shift_p3 = self.shift_p3(rgb_p3, ir_p3)
+        shift_p4 = self.shift_p4(rgb_p4, ir_p4)
+        shift_p5 = self.shift_p5(rgb_p5, ir_p5)
+        
+        return [shift_p3, shift_p4, shift_p5]

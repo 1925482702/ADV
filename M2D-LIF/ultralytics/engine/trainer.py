@@ -365,7 +365,12 @@ class Multimodal_Distillation_loss(nn.Module):
         self.normal_distillation = normal_distillation
         self.device = 'cuda'
 
-        if len(student_model.model) == 39:  # 如果添加LIF模块
+        # 🔥 修复：检测模型类型，支持 Shift 模型（40层）和 LIF 模型（39层）
+        # yolov8_shift_v2.yaml: 40层，RGB C2f 在 12,17,22，IR C2f 在 13,18,23
+        # yolov8-LIF.yaml: 39层，RGB C2f 在 12,17,22，IR C2f 在 13,18,23
+        # 其他双分支模型: RGB C2f 在 11,16,21，IR C2f 在 12,17,22
+        model_len = len(student_model.model)
+        if model_len >= 39:  # Shift 模型 (40层) 或 LIF 模型 (39层)
             layers_s_rgb = ["12", "17", "22"]
             layers_s_ir = ["13", "18", "23"]
             layers_t_rgb = ["4", "6", "8"]

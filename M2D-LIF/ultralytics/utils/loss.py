@@ -379,15 +379,39 @@ class v8ShiftDetectionLoss(v8DetectionLoss):
         pred_scores = torch.cat([pi.view(batch_size, self.nc, -1) for pi in pred_scores_list], 2)
 
         # 从 ShiftHead 获取 shift 预测
+        pred_shift = None
         if shift_out is not None:
-            # shift_out 是一个列表，包含三个尺度的 shift 预测
+            # 🔥 处理 ShiftHead 的输出格式
+            # ShiftHead 可能返回: (obb_output, [shift_p3, shift_p4, shift_p5]) 或 [shift_p3, shift_p4, shift_p5]
+            if isinstance(shift_out, tuple):
+                # 格式: (obb_output, shift_list)
+                shift_list = shift_out[1] if len(shift_out) > 1 else shift_out[0]
+            elif isinstance(shift_out, list) and len(shift_out) > 0:
+                # 检查第一个元素是否是 2 通道的 tensor (shift 预测)
+                if isinstance(shift_out[0], torch.Tensor) and shift_out[0].dim() == 4 and shift_out[0].shape[1] == 2:
+                    shift_list = shift_out
+                else:
+                    # 可能是 [obb_output, shift_list] 或其他格式
+                    # 尝试找到真正的 shift_list
+                    shift_list = []
+                    for item in shift_out:
+                        if isinstance(item, list):
+                            # 检查是否是 [shift_p3, shift_p4, shift_p5] 格式
+                            if all(isinstance(x, torch.Tensor) and x.dim() == 4 and x.shape[1] == 2 for x in item):
+                                shift_list = item
+                                break
+            else:
+                shift_list = []
+            
+            # 🔥 只处理 2 通道的 shift 预测
             pred_shift_list = []
-            for si in shift_out:
-                # si: [B, 2, H, W]
-                pred_shift_list.append(si.view(batch_size, 2, -1))
-            pred_shift = torch.cat(pred_shift_list, 2)  # [B, 2, N_anchors]
-        else:
-            pred_shift = None
+            for si in shift_list:
+                if isinstance(si, torch.Tensor) and si.dim() == 4 and si.shape[1] == 2:
+                    # si: [B, 2, H, W]
+                    pred_shift_list.append(si.view(si.shape[0], 2, -1))
+            
+            if pred_shift_list:
+                pred_shift = torch.cat(pred_shift_list, 2)  # [B, 2, N_anchors]
         
         pred_scores = pred_scores.permute(0, 2, 1).contiguous()  # [B, N_anchors, nc]
         pred_distri = pred_distri.permute(0, 2, 1).contiguous()  # [B, N_anchors, reg_max*4]
@@ -484,12 +508,21 @@ class v8ShiftDetectionLoss(v8DetectionLoss):
                 elementwise_loss = F.smooth_l1_loss(pred_shift_fg, shift_gt_fg, reduction='none')  # [N_fg_valid, 2]
                 weighted_loss = (elementwise_loss * weights.unsqueeze(1)).mean()
                 # 🔥 关键修复 3：使用动态获取的 shift_weight
-                loss[3] = weighted_loss * current_shift_weight * 100  # 乘以 100 增大量级，方便调参
+                loss[3] = weighted_loss * current_shift_weight * 100 # GT 已放大 100 倍，去掉 * 100
             else:
                 # 如果没有 shift_mask，对所有正样本计算
                 shift_loss = F.smooth_l1_loss(pred_shift_fg, shift_gt_fg, reduction='mean')
                 # 🔥 关键修复 3：使用动态获取的 shift_weight
-                loss[3] = shift_loss * current_shift_weight
+                loss[3] = shift_loss * current_shift_weight * 100
+            
+            # 🔥 调试：打印 GT 和预测值范围（每个 batch 都打印前 10 次）
+            if not hasattr(self, '_debug_count'):
+                self._debug_count = 0
+            if self._debug_count < 10:
+                print(f"[ShiftLoss] GT范围: [{shift_gt_fg.min():.3f}, {shift_gt_fg.max():.3f}], "
+                      f"Pred范围: [{pred_shift_fg.min():.3f}, {pred_shift_fg.max():.3f}], "
+                      f"样本数: {pred_shift_fg.shape[0]}")
+                self._debug_count += 1
         
         # 应用权重
         loss[0] *= self.hyp.box
@@ -1009,21 +1042,50 @@ class v8ShiftOBBLoss(v8OBBLoss):
         loss = torch.zeros(4, device=self.device)
         
         # 分离检测输出和 shift 输出
+        # 情况1: ShiftOBBModel 训练时输出 ((feats, angle), [shift_p3, shift_p4, shift_p5])
+        # 情况2: ShiftOBBModel 验证时输出 ((concat, (feats, angle)), None) 
+        # 情况3: 普通 OBB 模型训练时输出 (feats_list, angle)
+        # 情况4: 普通 OBB 模型验证时输出 (concat_tensor, (feats_list, angle))
+        
+        shift_out = None
+        pred_angle = None
+        
         if isinstance(preds, tuple) and len(preds) == 2:
-            obb_out, shift_out = preds[0], preds[1]
+            first, second = preds[0], preds[1]
             
-            # 处理 OBB 输出格式
-            # 训练时: (feats_list, angle) 其中 feats_list 是列表
-            # 验证时: (torch.cat([x[0], angle], 1), (x[1], angle))
-            if isinstance(obb_out[0], list):
-                # 训练格式: ([P3, P4, P5], angle)
-                feats_list, pred_angle = obb_out
+            # 检查是否是 ShiftOBBModel 训练格式: (obb_out, shift_list)
+            # shift_list 是包含 3 个 tensor 的列表
+            if isinstance(second, list) and len(second) > 0 and isinstance(second[0], torch.Tensor):
+                # ShiftOBBModel 训练格式
+                obb_out = first
+                shift_out = second
+                # 解析 obb_out
+                if isinstance(obb_out, tuple) and len(obb_out) == 2:
+                    feats_list, pred_angle = obb_out
+                else:
+                    feats_list = obb_out
+            # 检查是否是 ShiftOBBModel 验证格式: ((concat, (feats, angle)), None)
+            elif second is None and isinstance(first, tuple) and len(first) == 2:
+                # ShiftOBBModel 验证格式，first = (concat, (feats, angle))
+                inner_first, inner_second = first[0], first[1]
+                if isinstance(inner_second, tuple) and len(inner_second) == 2:
+                    # OBB 验证格式
+                    feats_list, pred_angle = inner_second
+                else:
+                    feats_list, pred_angle = first
+            # 检查是否是 OBB 验证格式: (concat_tensor, (feats_list, angle))
+            elif isinstance(second, tuple) and len(second) == 2:
+                # OBB 验证格式
+                feats_list, pred_angle = second
+            # 检查是否是 OBB 训练格式: (feats_list, angle)
+            elif isinstance(first, list):
+                # OBB 训练格式
+                feats_list, pred_angle = first, second
             else:
-                # 验证格式: (concat_tensor, (feats_list, angle))
-                feats_list, pred_angle = obb_out[1]
+                # 其他情况，尝试直接解包
+                feats_list, pred_angle = first, second
         else:
-            feats_list, shift_out = preds, None
-            pred_angle = None
+            feats_list = preds
         
         # 确保 feats_list 是列表格式
         if not isinstance(feats_list, list):
@@ -1130,10 +1192,10 @@ class v8ShiftOBBLoss(v8OBBLoss):
                             
                             elementwise_loss = F.smooth_l1_loss(pred_shift_fg, shift_gt_fg, reduction='none')
                             weighted_loss = (elementwise_loss * weights.unsqueeze(1)).mean()
-                            loss[3] = weighted_loss * current_shift_weight * 100
+                            loss[3] = weighted_loss * current_shift_weight * 100 # GT 已放大 10 倍，去掉 * 100
                         else:
                             shift_loss = F.smooth_l1_loss(pred_shift_fg, shift_gt_fg, reduction='mean')
-                            loss[3] = shift_loss * current_shift_weight * 100
+                            loss[3] = shift_loss * current_shift_weight * 100 # GT 已放大 10 倍，去掉 * 100
         
         # 应用权重
         loss[0] *= self.hyp.box

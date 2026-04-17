@@ -466,6 +466,16 @@ class ShiftDetectionModel(DetectionModel):
         # 表面上只返回 detect_out，完美骗过 YOLO 所有的底层检测和初始化！
         return detect_out
 
+    def __getstate__(self):
+        """排除 _shift_out，防止深拷贝崩溃"""
+        state = self.__dict__.copy()
+        state.pop('_shift_out', None)
+        return state
+
+    def __setstate__(self, state):
+        """恢复状态"""
+        self.__dict__.update(state)
+
     def loss(self, batch, preds=None):
         """拦截 batch，注入 modality，提取隐藏的 shift_out 并计算总 Loss"""
         if not hasattr(self, 'criterion'):
@@ -512,6 +522,41 @@ class ShiftOBBModel(OBBModel):
         """Initialize ShiftOBBModel."""
         super().__init__(cfg=cfg, ch=ch, nc=nc, verbose=verbose)
 
+    def _predict_once(self, x, profile=False, visualize=False, embed=None):
+        """前向传播，把 shift_out 藏在身上，伪装成正常 OBB 检测模型"""
+        y, dt = [], []
+        obb_out, shift_out = None, None
+
+        for m in self.model:
+            if m.f != -1:
+                x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]
+            if profile:
+                self._profile_one_layer(m, x, dt)
+
+            x = m(x)
+            y.append(x if m.i in self.save else None)
+
+            if type(m).__name__ == 'OBB':
+                obb_out = x
+            elif type(m).__name__ == 'ShiftHead':
+                shift_out = x
+
+        # 把 shift_out 藏在自己肚子里
+        self._shift_out = shift_out
+
+        # 表面上只返回 obb_out
+        return obb_out
+
+    def __getstate__(self):
+        """排除 _shift_out，防止深拷贝崩溃"""
+        state = self.__dict__.copy()
+        state.pop('_shift_out', None)
+        return state
+
+    def __setstate__(self, state):
+        """恢复状态"""
+        self.__dict__.update(state)
+
     def loss(self, batch, preds=None):
         """拦截 batch，注入 shift_modality，计算总 Loss"""
         if not hasattr(self, 'criterion'):
@@ -523,16 +568,127 @@ class ShiftOBBModel(OBBModel):
             if type(m).__name__ == 'ShiftHead':
                 m.shift_modality = shift_modality
 
-        # 2. 执行前向传播
-        if preds is None:
-            preds = self.forward(batch['img'])
-        
-        # 3. 调用损失函数（preds 已经包含 (obb_output, shift_output)）
-        return self.criterion(preds, batch)
+        # 2. 执行前向传播 (这会触发 _predict_once，生成并隐藏 _shift_out)
+        preds = self.forward(batch['img']) if preds is None else preds
+
+        # 3. 从肚子里掏出刚才藏好的 shift_out
+        shift_preds = getattr(self, '_shift_out', None)
+        # 用完焚毁，防止 checkpoint 保存时崩溃
+        self._shift_out = None
+
+        # 4. 如果 preds 已经是验证格式（外部传入），需要重新提取
+        # 验证时 preds 可能是 (concat_tensor, (feats_list, angle))，此时 shift_preds 为 None
+        if shift_preds is None and preds is not None:
+            # 验证模式：preds 由外部传入，shift_preds 为 None
+            # 检查 preds 是否已经包含正确格式
+            if isinstance(preds, tuple) and len(preds) == 2:
+                # 可能是 (obb_out, shift_list) 或验证格式
+                second = preds[1]
+                if isinstance(second, list):
+                    # 已经是正确格式，直接使用
+                    pass
+                elif isinstance(second, tuple):
+                    # 验证格式: (concat, (feats, angle))
+                    # 不需要 shift，直接传递给 loss
+                    pass
+
+        # 5. 打包成 (obb_output, shift_output) 交给 Loss 函数
+        return self.criterion((preds, shift_preds), batch)
 
     def init_criterion(self):
         """初始化损失函数，使用 ShiftOBBLoss"""
         return v8ShiftOBBLoss(self)
+
+
+class FrozenDualBranchModel(DetectionModel):
+    """
+    双分支冻结 Backbone 检测模型。
+    
+    使用预训练的 RGB 和 IR teacher 模型作为冻结 backbone，
+    然后通过可学习的卷积层融合特征。
+    
+    Args:
+        cfg: 模型配置 YAML
+        ch: 输入通道数 (默认 6，RGB+IR)
+        nc: 类别数
+        rgb_weight: RGB teacher 权重路径
+        ir_weight: IR teacher 权重路径
+        verbose: 是否打印模型信息
+    """
+    
+    def __init__(self, cfg='yolov8_dual_frozen.yaml', ch=6, nc=None, 
+                 rgb_weight=None, ir_weight=None, verbose=True):
+        # 存储 teacher 权重路径
+        self.rgb_weight = rgb_weight
+        self.ir_weight = ir_weight
+        
+        # 初始化基础 DetectionModel
+        super().__init__(cfg=cfg, ch=ch, nc=nc, verbose=verbose)
+        
+        # 加载并冻结 backbone 权重
+        if rgb_weight and ir_weight:
+            self._load_frozen_backbones(rgb_weight, ir_weight)
+    
+    def _load_frozen_backbones(self, rgb_weight, ir_weight):
+        """从 teacher 模型加载 backbone 权重并冻结"""
+        # 加载 teacher checkpoints
+        rgb_ckpt = torch.load(rgb_weight, map_location='cpu', weights_only=False)
+        ir_ckpt = torch.load(ir_weight, map_location='cpu', weights_only=False)
+        
+        rgb_state = rgb_ckpt['model'].state_dict() if 'model' in rgb_ckpt else rgb_ckpt
+        ir_state = ir_ckpt['model'].state_dict() if 'model' in ir_ckpt else ir_ckpt
+        
+        # 映射 teacher backbone 层到双分支模型
+        # 在基础 yaml 中: layers 3-12 是每个分支的 backbone conv/c2f 层
+        # RGB 分支: layers 3,5,7,9,11 (奇数索引，在 Multiin 之后)
+        # IR 分支: layers 4,6,8,10,12 (偶数索引，在 Multiin 之后)
+        
+        loaded_count = 0
+        frozen_count = 0
+        
+        for name, param in self.named_parameters():
+            # 从名称中解析层索引 (例如 'model.3.conv.weight' -> layer 3)
+            parts = name.split('.')
+            if len(parts) >= 2 and parts[0] == 'model':
+                try:
+                    layer_idx = int(parts[1])
+                except ValueError:
+                    continue
+                
+                # 确定这是否是 backbone 层以及属于哪个分支
+                # 基于 yolov8_shift.yaml:
+                # Layer 0: IN, 1: Multiin(RGB), 2: Multiin(IR)
+                # Layers 3,5,7,9,11,13,15,17,19,21,23 -> RGB 分支
+                # Layers 4,6,8,10,12,14,16,18,20,22,24 -> IR 分支
+                # 在 SPPF (layer 24) 之后，是 neck 层
+                
+                if layer_idx <= 2:  # 跳过 IN 和 Multiin 层
+                    continue
+                
+                # 映射到 teacher backbone 层
+                # RGB 分支 (从 3 开始的奇数层): 3->0, 5->1, 7->2, ...
+                # IR 分支 (从 4 开始的偶数层): 4->0, 6->1, 8->2, ...
+                
+                if layer_idx >= 3 and layer_idx <= 24:  # Backbone 层范围
+                    if (layer_idx - 3) % 2 == 0:  # RGB 分支 (3,5,7,...,23)
+                        teacher_layer_idx = (layer_idx - 3) // 2
+                        teacher_name = name.replace(f'model.{layer_idx}', f'model.{teacher_layer_idx}')
+                        if teacher_name in rgb_state:
+                            param.data.copy_(rgb_state[teacher_name])
+                            loaded_count += 1
+                    else:  # IR 分支 (4,6,8,...,24)
+                        teacher_layer_idx = (layer_idx - 4) // 2
+                        teacher_name = name.replace(f'model.{layer_idx}', f'model.{teacher_layer_idx}')
+                        if teacher_name in ir_state:
+                            param.data.copy_(ir_state[teacher_name])
+                            loaded_count += 1
+                    
+                    # 冻结 backbone 参数
+                    param.requires_grad = False
+                    frozen_count += 1
+        
+        LOGGER.info(f'[FrozenDualBranchModel] 加载了 {loaded_count} 个 backbone 参数')
+        LOGGER.info(f'[FrozenDualBranchModel] 冻结了 {frozen_count} 个 backbone 参数')
 
 
 class SegmentationModel(DetectionModel):
@@ -943,7 +1099,7 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
                 n = 1
         elif m is Multiin:
             c2 = ch[f]//2
-        elif m in (Add, LIFAdd):
+        elif m in (Add, LIFAdd, FusionAdd):
             c2 = ch[f[0]]
         elif m is LIF:
             c2 = 1
@@ -966,8 +1122,15 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             if m is Segment:
                 args[2] = make_divisible(min(args[2], max_channels) * width, 8)
         elif m is ShiftHead:
-            args.insert(0, [ch[x] for x in f])  # 把这6个输入的通道数打包传给 ShiftHead
+            # f 可能是整数或列表，统一处理
+            f_list = [f] if isinstance(f, int) else f
+            args.insert(0, [ch[x] for x in f_list])  # 把输入的通道数打包传给 ShiftHead
             c2 = 2  # 假装输出通道是2，防止报错（因为后面没层了，是多少无所谓）
+        elif m is SimpleShiftHead:
+            # 与 ShiftHead 相同的处理逻辑
+            f_list = [f] if isinstance(f, int) else f
+            args.insert(0, [ch[x] for x in f_list])
+            c2 = 2
         elif m is RTDETRDecoder:  # special case, channels arg must be passed in index 1
             args.insert(1, [ch[x] for x in f])
         else:

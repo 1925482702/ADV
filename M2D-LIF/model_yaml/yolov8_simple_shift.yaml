@@ -1,12 +1,14 @@
+# YOLOv8 Simple Shift Model - 使用简化版 ShiftHead（无注意力机制）
+# 用于快速对比实验，计算量显著低于 yolov8_shift.yaml
+
 ch: 6
 nc: 3 # FLIR
-scales: # model compound scaling constants, i.e. 'model=yolov8n.yaml' will call yolov8.yaml with scale 'n'
-  # [depth, width, max_channels]
-  n: [ 0.33, 0.25, 1024 ]  # YOLOv8n summary: 225 layers,  3157200 parameters,  3157184 gradients,   8.9 GFLOPs
-  s: [ 0.33, 0.50, 1024 ]  # YOLOv8s summary: 225 layers, 11166560 parameters, 11166544 gradients,  28.8 GFLOPs
-  m: [ 0.67, 0.75, 768 ]   # YOLOv8m summary: 295 layers, 25902640 parameters, 25902624 gradients,  79.3 GFLOPs
-  l: [ 1.00, 1.00, 512 ]   # YOLOv8l summary: 365 layers, 43691520 parameters, 43691504 gradients, 165.7 GFLOPs
-  x: [ 1.00, 1.25, 512 ]   # YOLOv8x summary: 365 layers, 68229648 parameters, 68229632 gradients, 258.7 GFLOPs
+scales: # model compound scaling constants
+  n: [ 0.33, 0.25, 1024 ]
+  s: [ 0.33, 0.50, 1024 ]
+  m: [ 0.67, 0.75, 768 ]
+  l: [ 1.00, 1.00, 512 ]
+  x: [ 1.00, 1.25, 512 ]
 
 backbone:
   - [ -1, 1, IN, [ ] ]  # 0
@@ -48,28 +50,25 @@ backbone:
 
   - [ -1, 1, SPPF, [ 512, 5 ] ] # 24
 
-
-
 head:
   - [ -1, 1, nn.Upsample, [ None, 2, 'nearest' ] ]
-  - [ [ -1, 18 ], 1, Concat, [ 1 ] ]  # cat backbone P4
+  - [ [ -1, 18 ], 1, Concat, [ 1 ] ]
   - [ -1, 3, C2f, [ 512 ] ]  # 27
 
   - [ -1, 1, nn.Upsample, [ None, 2, 'nearest' ] ]
-  - [ [ -1, 13 ], 1, Concat, [ 1 ] ]  # cat backbone P3
+  - [ [ -1, 13 ], 1, Concat, [ 1 ] ]
   - [ -1, 3, C2f, [ 256 ] ]  # 30 (P3/8-small)
 
   - [ -1, 1, Conv, [ 256, 3, 2 ] ]
-  - [ [ -1, 27 ], 1, Concat, [ 1 ] ]  # cat head P4
+  - [ [ -1, 27 ], 1, Concat, [ 1 ] ]
   - [ -1, 3, C2f, [ 512 ] ]  # 33 (P4/16-medium)
 
   - [ -1, 1, Conv, [ 512, 3, 2 ] ]
-  - [ [ -1, 24 ], 1, Concat, [ 1 ] ]  # cat head P5
+  - [ [ -1, 24 ], 1, Concat, [ 1 ] ]
   - [ -1, 3, C2f, [ 1024 ] ]  # 36 (P5/32-large)
 
   # Detect 检测头
-  - [ [ 30, 33, 36 ], 1, Detect, [ nc ] ]   # 37: Detect 检测头
+  - [ [ 30, 33, 36 ], 1, Detect, [ nc ] ]   # 37
 
-  # ShiftHead: 只连接独立 RGB/IR 特征，不连接 Detect 输出
-  # 层 11,12 = RGB/IR C2f P3; 层 16,17 = RGB/IR C2f P4; 层 21,22 = RGB/IR C2f P5
-  - [ [ 11, 12, 16, 17, 21, 22 ], 1, ShiftHead, [] ]  # 38: ShiftHead (6个输入)
+  # SimpleShiftHead: 简化版 Shift 预测头（无注意力，纯卷积）
+  - [ [ 37, 11, 12, 16, 17, 21, 22 ], 1, SimpleShiftHead, [] ]  # 38
