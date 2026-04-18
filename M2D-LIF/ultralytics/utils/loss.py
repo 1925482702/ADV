@@ -16,6 +16,47 @@ from .metrics import bbox_iou, probiou
 from .tal import bbox2dist
 
 
+def _resolve_shift_gt_for_fg(batch, fg_mask, target_gt_idx, device):
+    """Map per-image assigner GT indices onto the flattened batch shift tensors."""
+    shift_gt = batch["shift_gt"].to(device)
+    shift_mask = batch.get("shift_mask", None)
+    if shift_mask is not None:
+        shift_mask = shift_mask.to(device)
+
+    fg_mask_valid = torch.zeros_like(fg_mask, dtype=torch.bool)
+    if shift_gt.numel() == 0 or fg_mask.sum() == 0:
+        return shift_gt, shift_mask, torch.empty(0, device=device, dtype=torch.long), fg_mask_valid
+
+    batch_idx = batch["batch_idx"].to(device).view(-1).long()
+    if batch_idx.numel() == 0:
+        return shift_gt, shift_mask, torch.empty(0, device=device, dtype=torch.long), fg_mask_valid
+
+    batch_size = fg_mask.shape[0]
+    gt_counts = torch.bincount(batch_idx, minlength=batch_size)
+    positive_positions = fg_mask.nonzero(as_tuple=False)
+    fg_batch_idx = positive_positions[:, 0]
+    local_gt_idx = target_gt_idx[fg_mask].long()
+
+    valid = (local_gt_idx >= 0) & (local_gt_idx < gt_counts[fg_batch_idx])
+    if not valid.any():
+        return shift_gt, shift_mask, torch.empty(0, device=device, dtype=torch.long), fg_mask_valid
+
+    gt_offsets = torch.zeros(batch_size, device=device, dtype=torch.long)
+    if batch_size > 1:
+        gt_offsets[1:] = gt_counts.cumsum(0)[:-1]
+
+    valid_positions = positive_positions[valid]
+    global_gt_idx = local_gt_idx[valid] + gt_offsets[fg_batch_idx[valid]]
+    valid_global = global_gt_idx < shift_gt.shape[0]
+    if not valid_global.any():
+        return shift_gt, shift_mask, torch.empty(0, device=device, dtype=torch.long), fg_mask_valid
+
+    valid_positions = valid_positions[valid_global]
+    global_gt_idx = global_gt_idx[valid_global]
+    fg_mask_valid[valid_positions[:, 0], valid_positions[:, 1]] = True
+    return shift_gt, shift_mask, global_gt_idx, fg_mask_valid
+
+
 class VarifocalLoss(nn.Module):
     """
     Varifocal loss by Zhang et al.
@@ -457,28 +498,14 @@ class v8ShiftDetectionLoss(v8DetectionLoss):
         if pred_shift is not None and fg_mask.sum() > 0 and 'shift_gt' in batch:
             # shift_gt: [total_n_obj, 2] - 展平的所有物体的 shift GT
             # shift_mask: [total_n_obj] - 展平的所有物体的 shift mask
-            shift_gt = batch['shift_gt'].to(self.device)
-            shift_mask = batch.get('shift_mask', None)
-            if shift_mask is not None:
-                shift_mask = shift_mask.to(self.device)
+            shift_gt, shift_mask, gt_idx_for_fg, fg_mask_valid = _resolve_shift_gt_for_fg(
+                batch, fg_mask, target_gt_idx, self.device
+            )
             
-            # 检查 shift_gt 是否有有效数据
-            if len(shift_gt) == 0:
-                return loss
-            
-            # 获取正样本对应的 GT 索引
-            # target_gt_idx: [B, N_anchors]，每个 anchor 对应的 GT 索引（在展平的物体列表中）
-            gt_idx_for_fg = target_gt_idx[fg_mask]  # [N_fg]
-            
-            # 确保索引在有效范围内
-            valid_gt_idx = gt_idx_for_fg < len(shift_gt)
-            gt_idx_for_fg = gt_idx_for_fg[valid_gt_idx]
-            fg_mask_valid = torch.zeros_like(fg_mask, dtype=torch.bool)
-            fg_mask_valid[fg_mask] = valid_gt_idx
-            
+            # Convert per-image GT indices to flattened batch indices before gathering shift targets.
             if len(gt_idx_for_fg) == 0:
                 return loss
-            
+
             # 获取预测的 shift（仅对有效的正样本）
             pred_shift_fg = pred_shift[fg_mask_valid]  # [N_fg_valid, 2]
             
@@ -507,12 +534,12 @@ class v8ShiftDetectionLoss(v8DetectionLoss):
                 # 加权 smooth L1 loss
                 elementwise_loss = F.smooth_l1_loss(pred_shift_fg, shift_gt_fg, reduction='none')  # [N_fg_valid, 2]
                 weighted_loss = (elementwise_loss * weights.unsqueeze(1)).mean()
-                # 🔥 关键修复 3：使用动态获取的 shift_weight
-                loss[3] = weighted_loss * current_shift_weight * 100 # GT 已放大 100 倍，去掉 * 100
+                # Scale normalized shift loss to stay comparable with the detection losses.
+                loss[3] = weighted_loss * current_shift_weight * 100
             else:
                 # 如果没有 shift_mask，对所有正样本计算
                 shift_loss = F.smooth_l1_loss(pred_shift_fg, shift_gt_fg, reduction='mean')
-                # 🔥 关键修复 3：使用动态获取的 shift_weight
+                # Scale normalized shift loss to stay comparable with the detection losses.
                 loss[3] = shift_loss * current_shift_weight * 100
             
             # 🔥 调试：打印 GT 和预测值范围（每个 batch 都打印前 10 次）
@@ -1161,23 +1188,13 @@ class v8ShiftOBBLoss(v8OBBLoss):
         
         # ========== Shift 损失：只对正样本计算 ==========
         if pred_shift is not None and fg_mask.sum() > 0 and 'shift_gt' in batch:
-            shift_gt = batch['shift_gt'].to(self.device)
-            shift_mask = batch.get('shift_mask', None)
-            if shift_mask is not None:
-                shift_mask = shift_mask.to(self.device)
+            shift_gt, shift_mask, gt_idx_for_fg, fg_mask_valid = _resolve_shift_gt_for_fg(
+                batch, fg_mask, target_gt_idx, self.device
+            )
             
-            if len(shift_gt) == 0:
+            if len(gt_idx_for_fg) == 0:
                 pass  # skip shift loss
             else:
-                # 获取正样本对应的 GT 索引
-                gt_idx_for_fg = target_gt_idx[fg_mask]
-                
-                # 确保索引在有效范围内
-                valid_gt_idx = gt_idx_for_fg < len(shift_gt)
-                gt_idx_for_fg = gt_idx_for_fg[valid_gt_idx]
-                fg_mask_valid = torch.zeros_like(fg_mask, dtype=torch.bool)
-                fg_mask_valid[fg_mask] = valid_gt_idx
-                
                 if len(gt_idx_for_fg) > 0:
                     pred_shift_fg = pred_shift[fg_mask_valid]
                     shift_gt_fg = shift_gt[gt_idx_for_fg]
@@ -1192,10 +1209,10 @@ class v8ShiftOBBLoss(v8OBBLoss):
                             
                             elementwise_loss = F.smooth_l1_loss(pred_shift_fg, shift_gt_fg, reduction='none')
                             weighted_loss = (elementwise_loss * weights.unsqueeze(1)).mean()
-                            loss[3] = weighted_loss * current_shift_weight * 100 # GT 已放大 10 倍，去掉 * 100
+                            loss[3] = weighted_loss * current_shift_weight * 100
                         else:
                             shift_loss = F.smooth_l1_loss(pred_shift_fg, shift_gt_fg, reduction='mean')
-                            loss[3] = shift_loss * current_shift_weight * 100 # GT 已放大 10 倍，去掉 * 100
+                            loss[3] = shift_loss * current_shift_weight * 100
         
         # 应用权重
         loss[0] *= self.hyp.box
@@ -1331,21 +1348,11 @@ class v8ShiftDetectionLossV2(v8DetectionLoss):
         shift_pred = torch.cat(shift_preds, dim=2)  # [B, 2, N_total]
         shift_pred = shift_pred.permute(0, 2, 1)    # [B, N_total, 2]
         
-        # 获取 shift GT
-        shift_gt = batch['shift_gt'].to(self.device)
-        shift_mask = batch.get('shift_mask', None)
-        if shift_mask is not None:
-            shift_mask = shift_mask.to(self.device)
-        
-        # 获取正样本对应的 GT 索引
-        gt_idx_for_fg = target_gt_idx[fg_mask]  # [N_fg]
-        
-        # 确保索引在有效范围内
-        valid_gt_idx = gt_idx_for_fg < len(shift_gt)
-        gt_idx_for_fg = gt_idx_for_fg[valid_gt_idx]
-        fg_mask_valid = torch.zeros_like(fg_mask, dtype=torch.bool)
-        fg_mask_valid[fg_mask] = valid_gt_idx
-        
+        # Convert per-image GT indices to flattened batch indices before gathering shift targets.
+        shift_gt, shift_mask, gt_idx_for_fg, fg_mask_valid = _resolve_shift_gt_for_fg(
+            batch, fg_mask, target_gt_idx, self.device
+        )
+
         if len(gt_idx_for_fg) == 0:
             return torch.tensor(0.0, device=self.device)
         

@@ -457,7 +457,7 @@ class ShiftDetectionModel(DetectionModel):
 
             if type(m).__name__ == 'Detect':
                 detect_out = x
-            elif type(m).__name__ == 'ShiftHead':
+            elif type(m).__name__ in {'ShiftHead', 'SimpleShiftHead'}:
                 shift_out = x
 
         # 核心破局：把 shift_out 藏在自己肚子里！
@@ -484,7 +484,7 @@ class ShiftDetectionModel(DetectionModel):
         # 1. 从 batch 中提取 shift_modality，注入给 ShiftHead
         shift_modality = batch.get('shift_modality', None)
         for m in self.model:
-            if type(m).__name__ == 'ShiftHead':
+            if type(m).__name__ in {'ShiftHead', 'SimpleShiftHead'}:
                 m.shift_modality = shift_modality
 
         # 2. 执行前向传播 (这会触发上面的 _predict_once，生成并隐藏 _shift_out)
@@ -538,7 +538,7 @@ class ShiftOBBModel(OBBModel):
 
             if type(m).__name__ == 'OBB':
                 obb_out = x
-            elif type(m).__name__ == 'ShiftHead':
+            elif type(m).__name__ in {'ShiftHead', 'SimpleShiftHead'}:
                 shift_out = x
 
         # 把 shift_out 藏在自己肚子里
@@ -565,7 +565,7 @@ class ShiftOBBModel(OBBModel):
         # 1. 从 batch 中提取 shift_modality，注入给 ShiftHead
         shift_modality = batch.get('shift_modality', None)
         for m in self.model:
-            if type(m).__name__ == 'ShiftHead':
+            if type(m).__name__ in {'ShiftHead', 'SimpleShiftHead'}:
                 m.shift_modality = shift_modality
 
         # 2. 执行前向传播 (这会触发 _predict_once，生成并隐藏 _shift_out)

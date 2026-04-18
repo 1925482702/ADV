@@ -670,10 +670,11 @@ class CrossModalShift(nn.Module):
 
 class ShiftHead(nn.Module):
     """
-    独立的 Shift 预测头
+    默认 Shift 预测头。
 
-    接收三个尺度的 RGB 和 IR 独立特征，预测每个位置的跨模态偏移
-    使用交叉注意力显式对比两个模态的特征
+    原始的 CrossModalShift 注意力实现仍然保留在本文件中用于回滚和
+    ablation，但默认 ShiftHead 现在切换为更轻量的三层卷积分支，
+    以减少参数量、激活显存和训练时间。
     """
 
     def __init__(self, ch=()):
@@ -699,10 +700,15 @@ class ShiftHead(nn.Module):
             self.ch_rgb = (256, 512, 1024)
             self.ch_ir = (256, 512, 1024)
 
-        # 三个尺度的交叉注意力模块
+        # 默认恢复为原始的 attention 版 shift 分支。
         self.shift_p3 = CrossModalShift(self.ch_rgb[0])
         self.shift_p4 = CrossModalShift(self.ch_rgb[1])
         self.shift_p5 = CrossModalShift(self.ch_rgb[2])
+
+        # 轻量卷积分支暂时保留，后续做消融时可再切换回来。
+        # self.shift_p3 = SimpleCrossModalShift(self.ch_rgb[0])
+        # self.shift_p4 = SimpleCrossModalShift(self.ch_rgb[1])
+        # self.shift_p5 = SimpleCrossModalShift(self.ch_rgb[2])
 
         self.training = True
 
@@ -780,10 +786,10 @@ class ShiftHead(nn.Module):
 
 class SimpleCrossModalShift(nn.Module):
     """
-    简化版跨模态 Shift 预测模块（无注意力机制）
-    
-    使用简单的三层卷积处理拼接后的 RGB+IR 特征
-    计算量远小于 CrossModalShift，适合快速实验
+    简化版跨模态 Shift 预测模块（无注意力机制）。
+
+    为了保留 shift 方向信息，这个版本会先根据 shift_modality 对两个
+    模态做 reference/shifted 重排，再用一个小型三层卷积头预测 dx/dy。
     """
     
     def __init__(self, channels):
@@ -805,7 +811,7 @@ class SimpleCrossModalShift(nn.Module):
         Args:
             rgb_feat: [B, C, H, W]
             ir_feat: [B, C, H, W]
-            shift_modality: 忽略，保持接口一致
+            shift_modality: [B] tensor, 0=RGB shifted, 1=IR shifted
         
         Returns:
             shift_pred: [B, 2, H, W]
@@ -817,8 +823,20 @@ class SimpleCrossModalShift(nn.Module):
             rgb_feat = F.interpolate(rgb_feat, size=(target_h, target_w), mode='bilinear', align_corners=False)
             ir_feat = F.interpolate(ir_feat, size=(target_h, target_w), mode='bilinear', align_corners=False)
         
-        # 拼接后卷积
-        concat_feat = torch.cat([rgb_feat, ir_feat], dim=1)
+        if shift_modality is None:
+            shift_modality = torch.zeros(rgb_feat.shape[0], device=rgb_feat.device, dtype=torch.long)
+        else:
+            shift_modality = shift_modality.to(rgb_feat.device).long()
+
+        b, c, h, w = rgb_feat.shape
+        modality_mask = shift_modality.view(b, 1, 1, 1).expand(-1, c, h, w)
+
+        reference_feat = torch.where(modality_mask == 0, ir_feat, rgb_feat)
+        shifted_feat = torch.where(modality_mask == 0, rgb_feat, ir_feat)
+
+        # 旧的 modality-agnostic 拼接逻辑保留在这里，便于后续回滚：
+        # concat_feat = torch.cat([rgb_feat, ir_feat], dim=1)
+        concat_feat = torch.cat([reference_feat, shifted_feat], dim=1)
         return self.conv(concat_feat)
 
 
@@ -886,10 +904,15 @@ class SimpleShiftHead(nn.Module):
         
         if not self.training:
             return None
+
+        modality = getattr(self, 'shift_modality', None)
+        if modality is None:
+            b = rgb_p3.shape[0]
+            modality = torch.zeros(b, device=rgb_p3.device, dtype=torch.long)
         
         # 计算三个尺度的 shift 预测
-        shift_p3 = self.shift_p3(rgb_p3, ir_p3)
-        shift_p4 = self.shift_p4(rgb_p4, ir_p4)
-        shift_p5 = self.shift_p5(rgb_p5, ir_p5)
+        shift_p3 = self.shift_p3(rgb_p3, ir_p3, modality)
+        shift_p4 = self.shift_p4(rgb_p4, ir_p4, modality)
+        shift_p5 = self.shift_p5(rgb_p5, ir_p5, modality)
         
         return [shift_p3, shift_p4, shift_p5]

@@ -29,9 +29,9 @@ def load_model_weights(path):
 def get_layer_mapping():
     """获取 Teacher → Student 的层映射"""
     # Teacher → Student RGB 分支
-    teacher_to_rgb = {0: 3, 1: 5, 2: 7, 3: 9, 4: 11, 5: 14, 6: 16, 7: 19, 8: 21}
+    teacher_to_rgb = {0: 3, 1: 5, 2: 7, 3: 10, 4: 12, 5: 15, 6: 17, 7: 20, 8: 22}
     # Teacher → Student IR 分支
-    teacher_to_ir = {0: 4, 1: 6, 2: 8, 3: 10, 4: 12, 5: 15, 6: 17, 7: 20, 8: 22}
+    teacher_to_ir = {0: 4, 1: 6, 2: 8, 3: 11, 4: 13, 5: 16, 6: 18, 7: 21, 8: 23}
     return teacher_to_rgb, teacher_to_ir
 
 

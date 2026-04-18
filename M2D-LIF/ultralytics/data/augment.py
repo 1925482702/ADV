@@ -1971,7 +1971,9 @@ def v8_Pairedtransforms(dataset, imgsz, hyp, stretch=False):
     flip_idx = dataset.data.get("flip_idx", [])  # for keypoints augmentation
 
     # ObjectShift 放在所有几何变换之后，Format 之前
-    # 这样 shift_gt 就是最终图像上的像素偏移，无需维护坐标一致性
+    # 这样 shift_gt 就是最终图像上的归一化位移，无需维护坐标一致性
+    # ObjectShift runs after all geometric transforms and before Format.
+    # shift_gt is stored as final-image normalized displacement, so bbox coordinates stay unchanged.
     object_shift = ObjectShift(max_shift_px=max_shift_px, min_shift_px=min_shift_px, shift_ratio=shift_ratio, prob=1.0)
 
     return Compose(
@@ -2310,7 +2312,9 @@ class ObjectShift(BaseTransform):
         current_ratio = shift_param_manager.get_ratio()
 
         # 随机选择部分物体（使用动态比例）
-        n_shift = max(1, int(n_obj * current_ratio))
+        n_shift = 0 if current_ratio <= 0 else max(1, int(n_obj * current_ratio))
+        if n_shift == 0:
+            return
         shift_indices = np.random.choice(n_obj, size=min(n_shift, n_obj), replace=False).tolist()
         
         # 随机选择平移哪个模态 (RGB 或 IR)
@@ -2593,7 +2597,8 @@ class ObjectShift(BaseTransform):
         enlarged_region = target_img[valid_crop_y1:valid_crop_y2, valid_crop_x1:valid_crop_x2].copy()
         target_img[valid_paste_y1:valid_paste_y2, valid_paste_x1:valid_paste_x2] = enlarged_region
         
-        # 计算归一化平移量（乘以 100 扩大量级）
+        # 计算最终图像上的归一化位移
+        # Return normalized displacement relative to the final image size.
         shift_dx = final_dx_px / w
         shift_dy = final_dy_px / h
         
